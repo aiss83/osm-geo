@@ -226,6 +226,14 @@ pub fn decompress_if_needed(compressed: &Path) -> Result<PathBuf> {
         return Ok(dest);
     }
 
+    // Расширение предполагает архив, но magic bytes не совпадают → ошибка
+    if name.ends_with(".gz") || name.ends_with(".zst") {
+        anyhow::bail!(
+            "Файл имеет расширение архива, но не является сжатым (magic bytes не совпадают): {:?}",
+            compressed
+        );
+    }
+
     // Не сжатый файл
     Ok(compressed.to_path_buf())
 }
