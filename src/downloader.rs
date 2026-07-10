@@ -172,39 +172,62 @@ pub fn looks_like_region(path: &str) -> bool {
 }
 
 /// Распаковать файл, если он сжат (.gz или .zst).
+/// Определяет формат по MAGIC BYTES (а не по расширению) —
+/// работает даже если файл переименован.
 /// Возвращает путь к распакованному .pbf.
 pub fn decompress_if_needed(compressed: &Path) -> Result<PathBuf> {
+    // Читаем первые 4 байта для определения формата
+    let mut magic = [0u8; 4];
+    if let Ok(mut f) = std::fs::File::open(compressed) {
+        use std::io::Read;
+        let _ = f.read_exact(&mut magic);
+    }
+
     let name = compressed.to_str().unwrap_or("");
-    if name.ends_with(".gz") {
-        let dest = PathBuf::from(name.strip_suffix(".gz").unwrap());
+
+    // Gzip: magic = 1F 8B
+    if magic[0] == 0x1F && magic[1] == 0x8B {
+        let dest = if name.ends_with(".gz") {
+            PathBuf::from(name.strip_suffix(".gz").unwrap())
+        } else {
+            PathBuf::from(format!("{}.decompressed", name))
+        };
         if dest.exists() {
             info!("Распакованный файл уже существует: {:?}", dest);
             return Ok(dest);
         }
-        info!("Распаковка gzip: {:?} → {:?}", compressed, dest);
+        info!("Распаковка gzip (magic 1F 8B): {:?} → {:?}", compressed, dest);
         let input = std::fs::File::open(compressed)?;
         let mut decoder = flate2::read::GzDecoder::new(input);
         let mut output = std::fs::File::create(&dest)?;
         std::io::copy(&mut decoder, &mut output)?;
         info!("Распаковка завершена: {:?} ({:.1} МБ)", dest,
             std::fs::metadata(&dest)?.len() as f64 / (1024.0 * 1024.0));
-        Ok(dest)
-    } else if name.ends_with(".zst") {
-        let dest = PathBuf::from(name.strip_suffix(".zst").unwrap());
+        return Ok(dest);
+    }
+
+    // Zstd: magic = 28 B5 2F FD
+    if magic == [0x28, 0xB5, 0x2F, 0xFD] {
+        let dest = if name.ends_with(".zst") {
+            PathBuf::from(name.strip_suffix(".zst").unwrap())
+        } else {
+            PathBuf::from(format!("{}.decompressed", name))
+        };
         if dest.exists() {
             info!("Распакованный файл уже существует: {:?}", dest);
             return Ok(dest);
         }
-        info!("Распаковка zstd: {:?} → {:?}", compressed, dest);
+        info!("Распаковка zstd (magic 28 B5 2F FD): {:?} → {:?}", compressed, dest);
         let input = std::fs::read(compressed)?;
         let output = zstd::decode_all(&input[..])?;
         std::fs::write(&dest, output)?;
         info!("Распаковка завершена: {:?} ({:.1} МБ)", dest,
             std::fs::metadata(&dest)?.len() as f64 / (1024.0 * 1024.0));
-        Ok(dest)
-    } else {
-        Ok(compressed.to_path_buf())
+        return Ok(dest);
     }
+
+    // Не сжатый файл
+    Ok(compressed.to_path_buf())
 }
 
 /// Извлечь stem из имени файла для авто-генерации выходного имени.
