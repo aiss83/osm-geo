@@ -1,0 +1,10 @@
+/target
+/data/
+*.db
+*.db.zst
+*.bin
+*.bin.zst
+*.metadata.json
+*.osm.pbf
+*.osm.pbf.gz
+*.osm.pbf.zst

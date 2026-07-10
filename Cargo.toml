@@ -1,0 +1,35 @@
+[package]
+name = "osm-geo"
+version = "0.1.0"
+edition = "2024"
+description = "ETL-пайплайн для подготовки офлайн-базы геокодирования из OpenStreetMap"
+
+[dependencies]
+# PBF parsing
+osmpbf = "0.3"
+# SQLite with FTS5
+rusqlite = { version = "0.32", features = ["bundled", "vtab", "column_decltype"] }
+# CLI
+clap = { version = "4", features = ["derive"] }
+# JSON (metadata export)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Compression
+zstd = "0.13"
+# Gzip decompression
+flate2 = "1"
+# Hashing
+sha2 = "0.10"
+# HTTP client (download)
+reqwest = { version = "0.12", features = ["blocking"] }
+# Russian stemming
+rust-stemmers = "1"
+# HTML parsing
+regex-lite = "0.1"
+# Error handling
+anyhow = "1"
+# Progress bars
+indicatif = "0.17"
+# Logging
+log = "0.4"
+env_logger = "0.11"
