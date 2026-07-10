@@ -425,13 +425,29 @@ osm-geo build --input russia/central-fed-district --format compact --output cfd.
 
 | Секция | Размер | Описание |
 |--------|--------|----------|
-| Header | 24 B | magic ("OSMG"), version, offsets |
+| Header | 88 B | magic, version, счётчики, timestamp, регион, offsets (см. 9.3) |
 | String pool | ~10 MB | Все уникальные строки (города, улицы, названия). Индекс 0 — пустая строка. |
 | Named Index | ~8 MB | Сортирован по name → бинарный поиск для префиксного поиска |
 | Address Index | ~14 MB | Сортирован по (city, street, housenumber) |
 | Record Block | ~30 MB | Сортирован по (lat, lon) → бинарный поиск для пространственных запросов |
 
-### 9.3. Записи
+### 9.3. Заголовок (Header, 88 байт, little-endian)
+
+| Смещение | Размер | Поле | Описание |
+|----------|--------|------|----------|
+| 0 | 4 B | `magic` | `OSMG` (0x4F 0x53 0x4D 0x47) |
+| 4 | 2 B | `version` | Версия формата (1) |
+| 6 | 4 B | `record_count` | Общее количество объектов |
+| 10 | 4 B | `addr_count` | Количество адресов |
+| 14 | 4 B | `named_count` | Количество POI |
+| 18 | 8 B | `build_timestamp` | Unix timestamp времени сборки |
+| 26 | 46 B | `region` | Код региона, UTF-8, zero-padded (напр. `RU-CFD`) |
+| 72 | 4 B | `string_pool_offset` | Смещение до String Pool |
+| 76 | 4 B | `named_index_offset` | Смещение до Named Index |
+| 80 | 4 B | `addr_index_offset` | Смещение до Address Index |
+| 84 | 4 B | `records_offset` | Смещение до Record Block |
+
+### 9.4. Записи
 
 **Record Block** (сортирован по lat, lon):
 ```
@@ -458,7 +474,7 @@ housenumber_idx:  u16
 record_idx:       u32
 ```
 
-### 9.4. Поиск
+### 9.5. Поиск
 
 Потребитель выполняет бинарный поиск по сортированным массивам:
 
@@ -466,7 +482,7 @@ record_idx:       u32
 - **По адресу**: бинарный поиск в Address Index → record_idx → координаты
 - **По координатам**: бинарный поиск в Record Block по lat
 
-### 9.5. Размеры (ЦФО, 2.26M объектов)
+### 9.6. Размеры (ЦФО, 2.26M объектов)
 
 | Формат | Без сжатия | Zstd |
 |--------|-----------|------|

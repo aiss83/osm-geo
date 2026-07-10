@@ -6,7 +6,7 @@
 //! - Отсутствия накладных расходов SQLite
 //!
 //! Формат файла:
-//!   [Header: 72B] — magic, version, counts, timestamp, region
+//!   [Header: 88B] — magic, version, counts, timestamp, region, offsets
 //!   [String Pool]
 //!   [Named Index]    — сортирован по name, для префиксного поиска
 //!   [Address Index]  — сортирован по (city, street, housenumber)
@@ -19,7 +19,7 @@ use std::io::Write;
 
 use crate::model::GeoObject;
 
-/// Заголовок файла (72 байта, little-endian).
+/// Заголовок файла (88 байт, little-endian).
 #[repr(C, packed)]
 struct Header {
     magic: [u8; 4],             // "OSMG"
