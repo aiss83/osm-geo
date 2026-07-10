@@ -152,8 +152,12 @@ fn cmd_build(
 
     // 5. Запись в выбранном формате
     let file_size = if format == "compact" {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         let mut writer = compact::CompactWriter::new();
-        writer.build(&objects, &output_path)?;
+        writer.build(&objects, &output_path, region.unwrap_or("unknown"), timestamp)?;
         std::fs::metadata(&output_path)?.len()
     } else {
         let mut idx =

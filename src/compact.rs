@@ -6,7 +6,7 @@
 //! - Отсутствия накладных расходов SQLite
 //!
 //! Формат файла:
-//!   [Header: 24B]
+//!   [Header: 72B] — magic, version, counts, timestamp, region
 //!   [String Pool]
 //!   [Named Index]    — сортирован по name, для префиксного поиска
 //!   [Address Index]  — сортирован по (city, street, housenumber)
@@ -19,15 +19,17 @@ use std::io::Write;
 
 use crate::model::GeoObject;
 
-/// Заголовок файла (24 байта, little-endian).
+/// Заголовок файла (72 байта, little-endian).
 #[repr(C, packed)]
 struct Header {
-    magic: [u8; 4],            // "OSMG"
-    version: u16,              // 1
+    magic: [u8; 4],             // "OSMG"
+    version: u16,               // 1
     record_count: u32,
     addr_count: u32,
     named_count: u32,
-    string_pool_offset: u32,   // от начала файла
+    build_timestamp: u64,       // Unix timestamp (секунды)
+    region: [u8; 46],           // UTF-8, zero-padded
+    string_pool_offset: u32,
     named_index_offset: u32,
     addr_index_offset: u32,
     records_offset: u32,
@@ -171,7 +173,13 @@ impl CompactWriter {
     }
 
     /// Добавить объекты, отсортировать, построить индексы, записать файл.
-    pub fn build(&mut self, objects: &[GeoObject], output_path: &std::path::Path) -> Result<()> {
+    pub fn build(
+        &mut self,
+        objects: &[GeoObject],
+        output_path: &std::path::Path,
+        region: &str,
+        timestamp: u64,
+    ) -> Result<()> {
         info!("Построение компактного бинарного формата...");
 
         // 1. Первый проход: собираем все строки и строим записи
@@ -293,12 +301,19 @@ impl CompactWriter {
             .count() as u32;
         let named_count = self.records.len() as u32 - addr_count;
 
+        let mut region_bytes = [0u8; 46];
+        let region_utf8 = region.as_bytes();
+        let copy_len = region_utf8.len().min(45); // last byte stays 0
+        region_bytes[..copy_len].copy_from_slice(&region_utf8[..copy_len]);
+
         let header = Header {
             magic: *b"OSMG",
             version: 1,
             record_count: self.records.len() as u32,
             addr_count,
             named_count,
+            build_timestamp: timestamp,
+            region: region_bytes,
             string_pool_offset,
             named_index_offset,
             addr_index_offset,
@@ -422,7 +437,7 @@ mod tests {
 
         let path = std::path::PathBuf::from("/tmp/test_compact.bin");
         let mut writer = CompactWriter::new();
-        writer.build(&objects, &path).unwrap();
+        writer.build(&objects, &path, "RU-TEST", 0).unwrap();
 
         assert!(path.exists());
         let size = std::fs::metadata(&path).unwrap().len();
@@ -461,7 +476,7 @@ mod tests {
 
         let path = std::path::PathBuf::from("/tmp/test_compact_sort.bin");
         let mut writer = CompactWriter::new();
-        writer.build(&objects, &path).unwrap();
+        writer.build(&objects, &path, "RU-TEST", 0).unwrap();
 
         // Проверяем, что Named Index отсортирован: А < Б < В
         assert!(writer.named_index.len() == 3);
@@ -505,7 +520,7 @@ mod tests {
 
         let path = std::path::PathBuf::from("/tmp/test_compact_addr.bin");
         let mut writer = CompactWriter::new();
-        writer.build(&objects, &path).unwrap();
+        writer.build(&objects, &path, "RU-TEST", 0).unwrap();
 
         assert!(writer.addr_index.len() == 2);
 
