@@ -41,6 +41,13 @@ const STREET_TYPE_PREFIXES: &[&str] = &[
     "канал",
 ];
 
+/// Типы улиц женского рода — если прилагательное перед ними
+/// оканчивается на -ой/-ей (родительный падеж), исправляем на
+/// именительный: -ой→-ая, -ей→-яя.
+const FEMININE_STREET_TYPES: &[&str] = &[
+    "улица", "набережная", "площадь", "аллея", "линия", "дорога",
+];
+
 /// Корректор опечаток на основе SymSpell.
 pub struct Corrector {
     symspell: SymSpell<UnicodeStringStrategy>,
@@ -153,11 +160,67 @@ impl Corrector {
             return result.join(" ");
         }
 
-        // Обычный случай: первое слово с большой, остальные без изменений
+        // Обычный случай: первое слово с большой, остальные — тип улицы
+        // в конце приводится к нижнему регистру.
         let mut result = vec![title_case_first(words[0])];
-        for w in &words[1..] {
+        let last_idx = words.len() - 1;
+        for (i, w) in words[1..].iter().enumerate() {
+            let idx = i + 1;
+            if idx == last_idx {
+                let lower = w.to_lowercase();
+                if STREET_TYPE_PREFIXES.contains(&lower.as_str()) {
+                    result.push(lower);
+                    continue;
+                }
+            }
             result.push(w.to_string());
         }
+        result.join(" ")
+    }
+
+    /// Исправить согласование прилагательного с типом улицы.
+    ///
+    /// В OSM часто встречается «Калининградской улица» (родительный падеж)
+    /// вместо правильного «Калининградская улица» (именительный).
+    ///
+    /// Правило: если название имеет вид `<Прилагательное> <ТипУлицы>`,
+    /// где тип улицы — женского рода (улица, набережная, ...), а прилагательное
+    /// оканчивается на -ой/-ей — заменяем окончание на именительный падеж.
+    pub fn fix_adjective_agreement(text: &str) -> String {
+        let words: Vec<&str> = text.split_whitespace().collect();
+        if words.len() < 2 {
+            return text.to_string();
+        }
+
+        let last = words[words.len() - 1].to_lowercase();
+        if !FEMININE_STREET_TYPES.contains(&last.as_str()) {
+            return text.to_string();
+        }
+
+        // Проверяем предпоследнее слово — оно должно быть прилагательным
+        // в родительном падеже (оканчивается на -ой или -ей)
+        let adj = words[words.len() - 2];
+        let adj_lower = adj.to_lowercase();
+
+        let corrected_adj = if adj_lower.ends_with("ой") && adj_lower.len() > 3 {
+            // «Калининградской» → «Калининградская»
+            // Важно: отрезаем последние 2 символа (не байта!) — кириллица multibyte
+            let stem: String = adj.chars().take(adj.chars().count() - 2).collect();
+            format!("{}ая", stem)
+        } else if adj_lower.ends_with("ей") && adj_lower.len() > 3 {
+            // «Синей» → «Синяя»
+            let stem: String = adj.chars().take(adj.chars().count() - 2).collect();
+            format!("{}яя", stem)
+        } else {
+            return text.to_string();
+        };
+
+        let mut result: Vec<String> = words[..words.len() - 2]
+            .iter()
+            .map(|w| w.to_string())
+            .collect();
+        result.push(corrected_adj);
+        result.push(words[words.len() - 1].to_string());
         result.join(" ")
     }
 }

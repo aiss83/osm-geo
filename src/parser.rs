@@ -310,7 +310,8 @@ fn correct_field(value: Option<String>, corrector: Option<&Corrector>) -> Option
     match (value, corrector) {
         (Some(v), Some(c)) => {
             let corrected = c.correct(&v);
-            let normalized = Corrector::normalize_case(&corrected);
+            let agreed = Corrector::fix_adjective_agreement(&corrected);
+            let normalized = Corrector::normalize_case(&agreed);
             Some(normalized)
         }
         (v, _) => v,
