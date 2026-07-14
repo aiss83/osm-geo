@@ -11,6 +11,7 @@ use rust_stemmers::{Algorithm, Stemmer};
 use std::path::Path;
 
 use crate::model::GeoObject;
+use crate::corrector::Corrector;
 
 pub struct Indexer {
     conn: Connection,
@@ -145,8 +146,11 @@ impl Indexer {
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     params![
                         obj_type, lat, lon,
-                        addr.country, addr.city, addr.street,
-                        addr.housenumber, addr.postcode,
+                        addr.country.as_ref().map(|s| Corrector::normalize_chars(s)),
+                        addr.city.as_ref().map(|s| Corrector::normalize_chars(s)),
+                        addr.street.as_ref().map(|s| Corrector::normalize_chars(s)),
+                        addr.housenumber.as_ref().map(|s| Corrector::normalize_chars(s)),
+                        addr.postcode.as_ref().map(|s| Corrector::normalize_chars(s)),
                     ],
                 )?;
 
@@ -171,7 +175,9 @@ impl Indexer {
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![
                         obj_type, lat, lon,
-                        obj.name, obj.translit, obj.category,
+                        Corrector::normalize_chars(&obj.name),
+                        obj.translit.as_ref().map(|s| Corrector::normalize_chars(s)),
+                        obj.category.as_ref().map(|s| Corrector::normalize_chars(s)),
                     ],
                 )?;
 

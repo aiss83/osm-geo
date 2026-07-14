@@ -368,6 +368,7 @@ fn place_type_label(tags: &HashMap<String, String>) -> Option<String> {
 /// Применить корректор к полю, если оно задано и корректор доступен.
 /// Сначала исправляет опечатки, затем нормализует регистр.
 fn correct_field(value: Option<String>, corrector: Option<&Corrector>) -> Option<String> {
+    let value = value.map(|v| Corrector::normalize_chars(&v));
     match (value, corrector) {
         (Some(v), Some(c)) => {
             let corrected = c.correct(&v);

@@ -107,6 +107,18 @@ impl Corrector {
         })
     }
 
+    /// Нормализовать битые символы в тексте (OSM-артефакты).
+    pub fn normalize_chars(text: &str) -> String {
+        let mut result = text.to_string();
+        // Ƒ (Latin F with hook) — в OSM бывает и вместо Т, и вместо Д
+        if result.contains('\u{0191}') {
+            let with_t: String = result.chars().map(|c| if c == '\u{0191}' { 'Т' } else { c }).collect();
+            let with_d: String = result.chars().map(|c| if c == '\u{0191}' { 'Д' } else { c }).collect();
+            // Эвристика: если есть «олгорукого» — это Долгорукого
+            result = if with_t.contains("Толгорукого") { with_d } else { with_t };
+        }
+        result
+    }
     /// Исправить опечатки в тексте.
     ///
     /// Каждое слово проверяется через SymSpell. Слова длиной ≤ 3 символа
