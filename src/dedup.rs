@@ -3,7 +3,7 @@
 //! Удаляет дубликаты адресов (одинаковый city+street+housenumber)
 //! и POI (одинаковое name + близкие координаты).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use indicatif::{ProgressBar, ProgressStyle};
 use log::info;
@@ -13,7 +13,7 @@ use crate::model::GeoObject;
 pub fn deduplicate(objects: Vec<GeoObject>) -> Vec<GeoObject> {
     let original = objects.len();
     let mut seen_addresses: HashSet<AddressKey> = HashSet::new();
-    let mut seen_named: Vec<(String, f64, f64)> = Vec::new();
+    let mut seen_named: HashMap<String, Vec<(f64, f64)>> = HashMap::new();
     let mut result = Vec::with_capacity(original);
     let total = original as u64;
 
@@ -38,13 +38,20 @@ pub fn deduplicate(objects: Vec<GeoObject>) -> Vec<GeoObject> {
                 }
             }
             GeoObject::Named(ref named) => {
-                let is_dup = seen_named.iter().any(|(n, lat, lon)| {
-                    n == &named.name
-                        && haversine_approx(named.lat, named.lon, *lat, *lon) < 100.0
-                });
+                let is_dup = seen_named
+                    .get(&named.name)
+                    .map(|coords| {
+                        coords.iter().any(|&(lat, lon)| {
+                            haversine_approx(named.lat, named.lon, lat, lon) < 100.0
+                        })
+                    })
+                    .unwrap_or(false);
 
                 if !is_dup {
-                    seen_named.push((named.name.clone(), named.lat, named.lon));
+                    seen_named
+                        .entry(named.name.clone())
+                        .or_default()
+                        .push((named.lat, named.lon));
                     result.push(obj);
                 }
             }

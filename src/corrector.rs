@@ -91,16 +91,33 @@ impl Corrector {
     }
 
     /// Создать корректор из конкретного файла словаря.
+    /// Загружает словарь построчно с индикатором прогресса.
     pub fn from_file(dict_path: &Path) -> Result<Self> {
+        use std::io::{BufRead, BufReader};
+
         let mut symspell: SymSpell<UnicodeStringStrategy> = SymSpell::default();
 
-        symspell.load_dictionary(
-            dict_path.to_str().context("невалидный путь к словарю")?,
-            0,   // term_index  — колонка со словом (0-based)
-            1,   // count_index — колонка с частотой (0-based)
-            " ", // разделитель колонок
+        let file = std::fs::File::open(dict_path)
+            .context("Открытие файла словаря")?;
+        let file_size = file.metadata()?.len();
+        let reader = BufReader::new(file);
+
+        let pb = indicatif::ProgressBar::new(file_size);
+        pb.set_style(
+            indicatif::ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] Загрузка словаря SymSpell: {bytes}/{total_bytes} ({bytes_per_sec})")
+                .unwrap()
+                .progress_chars("##-"),
         );
 
+        for line in reader.lines() {
+            let line = line.context("Чтение строки словаря")?;
+            let line_len = line.len() as u64 + 1; // +1 за отброшенный \n
+            symspell.load_dictionary_line(&line, 0, 1, " ");
+            pb.inc(line_len);
+        }
+
+        pb.finish_with_message("Словарь SymSpell загружен");
         info!("Словарь SymSpell загружен");
         Ok(Self {
             symspell,
@@ -110,12 +127,26 @@ impl Corrector {
     /// Нормализовать битые символы в тексте (OSM-артефакты).
     pub fn normalize_chars(text: &str) -> String {
         let mut result = text.to_string();
-        // Ƒ (Latin F with hook) — в OSM бывает и вместо Т, и вместо Д
+        // Ƒ (Latin F with hook) — в OSM кодирует Д, Т или К.
+        // Эвристика: генерируем все три варианта и выбираем по известным stem'ам.
+        // По умолчанию — Д (наиболее частый случай).
         if result.contains('\u{0191}') {
             let with_t: String = result.chars().map(|c| if c == '\u{0191}' { 'Т' } else { c }).collect();
             let with_d: String = result.chars().map(|c| if c == '\u{0191}' { 'Д' } else { c }).collect();
-            // Эвристика: если есть «олгорукого» — это Долгорукого
-            result = if with_t.contains("Толгорукого") { with_d } else { with_t };
+            let with_k: String = result.chars().map(|c| if c == '\u{0191}' { 'К' } else { c }).collect();
+
+            let is_t = with_t.contains("Тверс")   // Тверская
+                    || with_t.contains("Тульс")    // Тульская
+                    || with_t.contains("Томс");    // Томская
+
+            let is_k = with_k.contains("Камск")   // Камский
+                    || with_k.contains("Курск")    // Курская
+                    || with_k.contains("Казан")    // Казанская
+                    || with_k.contains("Киевс")    // Киевская
+                    || with_k.contains("Коломен")  // Коломенская
+                    || with_k.contains("Красно");  // Краснодарская, Красноармейская
+
+            result = if is_t { with_t } else if is_k { with_k } else { with_d };
         }
         result
     }
@@ -294,8 +325,24 @@ fn download_dict(dest: &Path) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
-    info!("Загрузка словаря (может занять несколько минут, ~30 МБ)...");
     let mut resp = reqwest::blocking::get(DICT_URL)?;
+    let total = resp.content_length().unwrap_or(0);
+    let pb = indicatif::ProgressBar::new(total);
+    if total > 0 {
+        pb.set_style(
+            indicatif::ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] Загрузка словаря: {bytes}/{total_bytes} ({bytes_per_sec})")
+                .unwrap()
+                .progress_chars("##-"),
+        );
+    } else {
+        pb.set_style(
+            indicatif::ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] Загрузка словаря: {bytes} ({bytes_per_sec})")
+                .unwrap(),
+        );
+    }
+
     let mut file = std::fs::File::create(dest)?;
     let mut buf = [0u8; 65536];
     loop {
@@ -304,8 +351,10 @@ fn download_dict(dest: &Path) -> Result<()> {
             break;
         }
         std::io::Write::write_all(&mut file, &buf[..n])?;
+        pb.inc(n as u64);
     }
 
+    pb.finish_with_message("Словарь загружен");
     info!("Словарь сохранён: {:?}", dest);
     Ok(())
 }

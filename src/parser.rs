@@ -27,11 +27,6 @@ pub struct PbfParser {
     named_objects: u64,
     /// Кэш координат нод (node_id → (lat, lon)).
     node_coords: HashMap<i64, (f64, f64)>,
-    /// Включить разрешение координат way (может потреблять много памяти).
-    resolve_way_coords: bool,
-    /// Статистика: сколько way получили реальные координаты.
-    ways_resolved: u64,
-    ways_unresolved: u64,
     /// Опциональный корректор опечаток (SymSpell).
     corrector: Option<Corrector>,
     /// Типы населённых пунктов: название → описание (СНТ, посёлок, ...)
@@ -47,9 +42,6 @@ impl PbfParser {
             addresses: 0,
             named_objects: 0,
             node_coords: HashMap::new(),
-            resolve_way_coords: true,
-            ways_resolved: 0,
-            ways_unresolved: 0,
             corrector: None,
             place_types: HashMap::new(),
         }
@@ -84,14 +76,6 @@ impl PbfParser {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    pub fn new_no_way_coords() -> Self {
-        Self {
-            resolve_way_coords: false,
-            ..Self::new()
-        }
-    }
-
     /// Разобрать PBF-файл и вернуть вектор GeoObject.
     pub fn parse_file(&mut self, path: &Path) -> Result<Vec<GeoObject>> {
         info!("Парсинг PBF-файла: {:?}", path);
@@ -113,17 +97,17 @@ impl PbfParser {
 
         let reader = ElementReader::from_path(path)?;
         let mut objects = Vec::new();
+        let mut pb_bytes: u64 = 0;
+        const PB_FLUSH: u64 = 2_000_000; // обновляем progress bar каждые ~2 МБ
 
         reader.for_each(|element| {
             match element {
                 Element::Node(node) => {
                     self.nodes += 1;
-                    pb.set_position(pb.position() + 128);
+                    pb_bytes += 128;
                     let id = node.id();
 
-                    if self.resolve_way_coords {
-                        self.node_coords.insert(id, (node.lat(), node.lon()));
-                    }
+                    self.node_coords.insert(id, (node.lat(), node.lon()));
 
                     let tags: HashMap<String, String> = node
                         .tags()
@@ -133,12 +117,10 @@ impl PbfParser {
                 }
                 Element::DenseNode(node) => {
                     self.nodes += 1;
-                    pb.set_position(pb.position() + 64);
+                    pb_bytes += 64;
                     let id = node.id();
 
-                    if self.resolve_way_coords {
-                        self.node_coords.insert(id, (node.lat(), node.lon()));
-                    }
+                    self.node_coords.insert(id, (node.lat(), node.lon()));
 
                     let tags: HashMap<String, String> = node
                         .tags()
@@ -148,23 +130,19 @@ impl PbfParser {
                 }
                 Element::Way(way) => {
                     self.ways += 1;
-                    pb.set_position(pb.position() + 256);
+                    pb_bytes += 256;
                     let tags: HashMap<String, String> = way
                         .tags()
                         .map(|(k, v)| (k.to_string(), v.to_string()))
                         .collect();
 
-                    let (lat, lon) = if self.resolve_way_coords {
-                        self.compute_way_centroid(&way)
-                    } else {
-                        (0.0, 0.0)
-                    };
+                    let (lat, lon) = self.compute_way_centroid(&way);
 
                     self.process_element(&tags, lat, lon, &mut objects);
                 }
                 Element::Relation(rel) => {
                     self.relations += 1;
-                    pb.set_position(pb.position() + 512);
+                    pb_bytes += 512;
                     let tags: HashMap<String, String> = rel
                         .tags()
                         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -172,21 +150,23 @@ impl PbfParser {
                     self.process_relation(&tags, &mut objects);
                 }
             }
+
+            if pb_bytes >= PB_FLUSH {
+                pb.set_position(pb.position() + pb_bytes);
+                pb_bytes = 0;
+            }
         })?;
+
+        if pb_bytes > 0 {
+            pb.set_position(pb.position() + pb_bytes);
+        }
 
         pb.set_message(format!("{}", objects.len()));
         pb.finish_with_message(format!("Извлечено {} объектов", objects.len()));
 
-        if self.resolve_way_coords {
-            info!(
-                "Кэш нод: {} записей, ways с координатами: {}, без: {}",
-                self.node_coords.len(),
-                self.ways_resolved,
-                self.ways_unresolved
-            );
-            self.node_coords.clear();
-            self.node_coords.shrink_to_fit();
-        }
+        info!("Кэш нод: {} записей", self.node_coords.len());
+        self.node_coords.clear();
+        self.node_coords.shrink_to_fit();
 
         info!(
             "Парсинг завершён: nodes={}, ways={}, relations={}, addresses={}, named_objects={}",
@@ -210,10 +190,8 @@ impl PbfParser {
         }
 
         if count > 0 {
-            self.ways_resolved += 1;
             (sum_lat / count as f64, sum_lon / count as f64)
         } else {
-            self.ways_unresolved += 1;
             (0.0, 0.0)
         }
     }
@@ -366,18 +344,21 @@ fn place_type_label(tags: &HashMap<String, String>) -> Option<String> {
 }
 
 /// Применить корректор к полю, если оно задано и корректор доступен.
-/// Сначала исправляет опечатки, затем нормализует регистр.
+/// Порядок важен: сначала SymSpell (он пропускает не-кириллицу вроде Ƒ),
+/// затем normalize_chars исправляет битые OSM-символы.
 fn correct_field(value: Option<String>, corrector: Option<&Corrector>) -> Option<String> {
-    let value = value.map(|v| Corrector::normalize_chars(&v));
-    match (value, corrector) {
+    // 1. SymSpell-коррекция опечаток + нормализация регистра
+    let value = match (&value, corrector) {
         (Some(v), Some(c)) => {
-            let corrected = c.correct(&v);
+            let corrected = c.correct(v);
             let agreed = Corrector::fix_adjective_agreement(&corrected);
             let normalized = Corrector::normalize_case(&agreed);
             Some(normalized)
         }
-        (v, _) => v,
-    }
+        _ => value,
+    };
+    // 2. Нормализация битых символов (Ƒ→Д/Т/К)
+    value.map(|v| Corrector::normalize_chars(&v))
 }
 
 /// Извлечь NamedObject из тегов. Только русское имя + транслитерация.
@@ -442,12 +423,6 @@ mod tests {
     fn test_extract_named_object_no_name() {
         let tags = HashMap::new();
         assert!(extract_named_object(&tags, 0.0, 0.0, None).is_none());
-    }
-
-    #[test]
-    fn test_parser_no_way_coords() {
-        let parser = PbfParser::new_no_way_coords();
-        assert!(!parser.resolve_way_coords);
     }
 
     #[test]

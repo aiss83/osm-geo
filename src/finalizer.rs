@@ -5,14 +5,15 @@ use log::info;
 use std::io::Read;
 use std::path::Path;
 
-/// Сжать SQLite-файл алгоритмом Zstandard и записать метаданные.
+/// Сжать SQLite-файл алгоритмом Zstandard, вычислить SHA-256 и записать метаданные.
 ///
-/// Возвращает размер сжатого файла в байтах.
+/// Возвращает (размер сжатого файла, SHA-256, метаданные JSON).
+/// SHA-256 вычисляется из буфера в памяти, без повторного чтения файла.
 pub fn compress_and_export_metadata(
     db_path: &Path,
     output_dir: &Path,
-    metadata: &Metadata,
-) -> Result<(u64, String)> {
+    metadata: &mut Metadata,
+) -> Result<(u64, String, String)> {
     // Читаем исходную базу
     info!("Сжатие базы данных...");
     let mut input = Vec::new();
@@ -20,6 +21,10 @@ pub fn compress_and_export_metadata(
         .context("Открытие базы для сжатия")?
         .read_to_end(&mut input)
         .context("Чтение базы")?;
+
+    // SHA-256 из буфера в памяти (без повторного чтения файла)
+    let sha256 = sha256_from_bytes(&input);
+    metadata.sha256 = sha256.clone();
 
     let original_size = input.len();
 
@@ -52,7 +57,7 @@ pub fn compress_and_export_metadata(
 
     info!("Метаданные записаны: {:?}", metadata_path);
 
-    Ok((compressed_size as u64, metadata_json))
+    Ok((compressed_size as u64, sha256, metadata_json))
 }
 
 /// Метаданные о собранной базе.
@@ -68,6 +73,14 @@ pub struct Metadata {
     pub db_size_bytes: u64,
     pub compressed_size_bytes: Option<u64>,
     pub sha256: String,
+}
+
+/// Вычислить SHA-256 хеш от байтового буфера.
+fn sha256_from_bytes(data: &[u8]) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(data);
+    format!("{:x}", hasher.finalize())
 }
 
 /// Вычислить SHA-256 хеш файла.

@@ -197,8 +197,7 @@ fn cmd_build(
 
     // 6. Сжатие и метаданные (для обоих форматов)
     let output_dir = output_path.parent().unwrap_or(std::path::Path::new("."));
-    let sha256 = finalizer::sha256_file(&output_path)?;
-    let metadata = finalizer::Metadata {
+    let mut metadata = finalizer::Metadata {
         version: env!("CARGO_PKG_VERSION").to_string(),
         region: region.unwrap_or("unknown").to_string(),
         build_date: chrono_now(),
@@ -208,11 +207,11 @@ fn cmd_build(
         named_count: named_count as u64,
         db_size_bytes: file_size,
         compressed_size_bytes: None,
-        sha256: sha256.clone(),
+        sha256: String::new(), // будет заполнен в compress_and_export_metadata
     };
 
-    let (compressed_size, _meta_json) =
-        finalizer::compress_and_export_metadata(&output_path, output_dir, &metadata)?;
+    let (compressed_size, sha256, _meta_json) =
+        finalizer::compress_and_export_metadata(&output_path, output_dir, &mut metadata)?;
 
     info!("SHA-256: {}", sha256);
     info!(

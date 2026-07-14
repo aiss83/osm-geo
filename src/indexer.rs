@@ -11,7 +11,6 @@ use rust_stemmers::{Algorithm, Stemmer};
 use std::path::Path;
 
 use crate::model::GeoObject;
-use crate::corrector::Corrector;
 
 pub struct Indexer {
     conn: Connection,
@@ -35,7 +34,8 @@ impl Indexer {
              PRAGMA synchronous = NORMAL;
              PRAGMA mmap_size = 268435456;
              PRAGMA cache_size = -65536;
-             PRAGMA page_size = 4096;",
+             PRAGMA page_size = 4096;
+             PRAGMA auto_vacuum = INCREMENTAL;",
         )?;
 
         let stemmer = Stemmer::create(Algorithm::Russian);
@@ -111,10 +111,9 @@ impl Indexer {
     }
 
     pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
-        self.conn.execute(
+        self.conn.prepare_cached(
             "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
-            params![key, value],
-        )?;
+        )?.execute(params![key, value])?;
         Ok(())
     }
 
@@ -140,19 +139,18 @@ impl Indexer {
 
         match obj {
             GeoObject::Address(addr) => {
-                self.conn.execute(
+                self.conn.prepare_cached(
                     "INSERT INTO objects (type, lat, lon,
                         country, city, street, housenumber, postcode)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                    params![
-                        obj_type, lat, lon,
-                        addr.country.as_ref().map(|s| Corrector::normalize_chars(s)),
-                        addr.city.as_ref().map(|s| Corrector::normalize_chars(s)),
-                        addr.street.as_ref().map(|s| Corrector::normalize_chars(s)),
-                        addr.housenumber.as_ref().map(|s| Corrector::normalize_chars(s)),
-                        addr.postcode.as_ref().map(|s| Corrector::normalize_chars(s)),
-                    ],
-                )?;
+                )?.execute(params![
+                    obj_type, lat, lon,
+                    addr.country.as_deref(),
+                    addr.city.as_deref(),
+                    addr.street.as_deref(),
+                    addr.housenumber.as_deref(),
+                    addr.postcode.as_deref(),
+                ])?;
 
                 let id = self.conn.last_insert_rowid();
 
@@ -162,24 +160,22 @@ impl Indexer {
                 let housenumber = addr.housenumber.as_deref().unwrap_or("");
                 let postcode = addr.postcode.as_deref().unwrap_or("");
 
-                self.conn.execute(
+                self.conn.prepare_cached(
                     "INSERT INTO fts_address (rowid, country, city, street, housenumber, postcode)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![id, country, city, street, housenumber, postcode],
-                )?;
+                )?.execute(params![id, country, city, street, housenumber, postcode])?;
             }
             GeoObject::Named(obj) => {
-                self.conn.execute(
+                self.conn.prepare_cached(
                     "INSERT INTO objects (type, lat, lon,
                         name, translit, category)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![
-                        obj_type, lat, lon,
-                        Corrector::normalize_chars(&obj.name),
-                        obj.translit.as_ref().map(|s| Corrector::normalize_chars(s)),
-                        obj.category.as_ref().map(|s| Corrector::normalize_chars(s)),
-                    ],
-                )?;
+                )?.execute(params![
+                    obj_type, lat, lon,
+                    obj.name.as_str(),
+                    obj.translit.as_deref(),
+                    obj.category.as_deref(),
+                ])?;
 
                 let id = self.conn.last_insert_rowid();
 
@@ -191,11 +187,10 @@ impl Indexer {
                     .unwrap_or_default();
                 let category = obj.category.as_deref().unwrap_or("");
 
-                self.conn.execute(
+                self.conn.prepare_cached(
                     "INSERT INTO fts_named (rowid, name, translit, category)
                      VALUES (?1, ?2, ?3, ?4)",
-                    params![id, name, translit, category],
-                )?;
+                )?.execute(params![id, name, translit, category])?;
             }
         }
 
@@ -230,9 +225,9 @@ impl Indexer {
             [],
         )?;
 
-        info!("VACUUM (дефрагментация)...");
+        info!("Дефрагментация (incremental_vacuum)...");
         self.conn.execute("PRAGMA optimize", [])?;
-        self.conn.execute("VACUUM", [])?;
+        self.conn.execute("PRAGMA incremental_vacuum", [])?;
 
         info!("Оптимизация завершена");
         Ok(())

@@ -18,7 +18,6 @@ use std::collections::HashMap;
 use std::io::Write;
 
 use crate::model::GeoObject;
-use crate::corrector::Corrector;
 
 /// Заголовок файла (88 байт, little-endian).
 #[repr(C, packed)]
@@ -190,12 +189,12 @@ impl CompactWriter {
             let (lat, lon) = obj.lat_lon();
             let record = match obj {
                 GeoObject::Address(addr) => {
-                    let city_idx = self.pool.intern(addr.city.as_deref().map(|s| Corrector::normalize_chars(s)).as_deref());
-                    let street_idx = self.pool.intern(addr.street.as_deref().map(|s| Corrector::normalize_chars(s)).as_deref());
-                    let hn_idx = self.pool.intern(addr.housenumber.as_deref().map(|s| Corrector::normalize_chars(s)).as_deref());
+                    let city_idx = self.pool.intern(addr.city.as_deref());
+                    let street_idx = self.pool.intern(addr.street.as_deref());
+                    let hn_idx = self.pool.intern(addr.housenumber.as_deref());
                     // Интернируем страну и индекс — не храним, но они нужны для полноты пула
-                    self.pool.intern(addr.country.as_deref().map(|s| Corrector::normalize_chars(s)).as_deref());
-                    self.pool.intern(addr.postcode.as_deref().map(|s| Corrector::normalize_chars(s)).as_deref());
+                    self.pool.intern(addr.country.as_deref());
+                    self.pool.intern(addr.postcode.as_deref());
 
                     RecordEntry {
                         obj_type: 0,
@@ -206,8 +205,8 @@ impl CompactWriter {
                     }
                 }
                 GeoObject::Named(obj) => {
-                    let name_idx = self.pool.intern(Some(&Corrector::normalize_chars(&obj.name)));
-                    let translit_idx = self.pool.intern(obj.translit.as_deref().map(|s| Corrector::normalize_chars(s)).as_deref());
+                    let name_idx = self.pool.intern(Some(&obj.name));
+                    let translit_idx = self.pool.intern(obj.translit.as_deref());
                     let category = category_to_tag(obj.category.as_deref());
 
                     RecordEntry {
@@ -250,10 +249,9 @@ impl CompactWriter {
         // для поддержки регистронезависимого бинарного поиска.
         // Потребитель обязан lowercasing-ить запрос и строку пула при сравнении.
         let pool = &self.pool;
-        self.named_index.sort_by(|a, b| {
-            let name_a = &pool.strings[a.name_idx as usize];
-            let name_b = &pool.strings[b.name_idx as usize];
-            name_a.to_lowercase().cmp(&name_b.to_lowercase())
+        // sort_by_cached_key: вычисляет lowercase один раз на элемент, а не O(n log n) раз
+        self.named_index.sort_by_cached_key(|e| {
+            pool.strings[e.name_idx as usize].to_lowercase()
         });
 
         info!("Named Index: {} записей", self.named_index.len());
@@ -273,22 +271,13 @@ impl CompactWriter {
         // Сортируем Address Index по (city, street, housenumber), case-insensitive
         // для поддержки регистронезависимого бинарного поиска.
         // Потребитель обязан lowercasing-ить запрос и строки пула при сравнении.
-        self.addr_index.sort_by(|a, b| {
-            let city_a = &pool.strings[a.city_idx as usize];
-            let city_b = &pool.strings[b.city_idx as usize];
-            city_a
-                .to_lowercase()
-                .cmp(&city_b.to_lowercase())
-                .then_with(|| {
-                    let street_a = &pool.strings[a.street_idx as usize];
-                    let street_b = &pool.strings[b.street_idx as usize];
-                    street_a.to_lowercase().cmp(&street_b.to_lowercase())
-                })
-                .then_with(|| {
-                    let hn_a = &pool.strings[a.housenumber_idx as usize];
-                    let hn_b = &pool.strings[b.housenumber_idx as usize];
-                    hn_a.to_lowercase().cmp(&hn_b.to_lowercase())
-                })
+        // sort_by_cached_key: вычисляет lowercase-ключи один раз на элемент
+        self.addr_index.sort_by_cached_key(|e| {
+            (
+                pool.strings[e.city_idx as usize].to_lowercase(),
+                pool.strings[e.street_idx as usize].to_lowercase(),
+                pool.strings[e.housenumber_idx as usize].to_lowercase(),
+            )
         });
 
         info!("Address Index: {} записей", self.addr_index.len());
