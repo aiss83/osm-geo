@@ -48,6 +48,17 @@ const FEMININE_STREET_TYPES: &[&str] = &[
     "улица", "набережная", "площадь", "аллея", "линия", "дорога",
 ];
 
+/// Типы улиц мужского рода: -ой→-ый/-ий, -ей→-ий.
+const MASCULINE_STREET_TYPES: &[&str] = &[
+    "проспект", "переулок", "бульвар", "проезд", "тупик",
+    "вал", "спуск", "подъезд", "тракт", "мост", "канал",
+];
+
+/// Типы улиц среднего рода: -ой→-ое, -ей→-ее.
+const NEUTER_STREET_TYPES: &[&str] = &[
+    "шоссе",
+];
+
 /// Корректор опечаток на основе SymSpell.
 pub struct Corrector {
     symspell: SymSpell<UnicodeStringStrategy>,
@@ -183,9 +194,11 @@ impl Corrector {
     /// В OSM часто встречается «Калининградской улица» (родительный падеж)
     /// вместо правильного «Калининградская улица» (именительный).
     ///
-    /// Правило: если название имеет вид `<Прилагательное> <ТипУлицы>`,
-    /// где тип улицы — женского рода (улица, набережная, ...), а прилагательное
-    /// оканчивается на -ой/-ей — заменяем окончание на именительный падеж.
+    /// Правило: для названий вида `<Прилагательное> <ТипУлицы>` исправляем
+    /// окончание прилагательного на именительный падеж нужного рода:
+    /// - Женский (улица, площадь, ...):  -ой→-ая, -ей→-яя
+    /// - Мужской (проспект, переулок, ...): -ой→-ый/-ий, -ей→-ий
+    /// - Средний (шоссе):                -ой→-ое, -ей→-ее
     pub fn fix_adjective_agreement(text: &str) -> String {
         let words: Vec<&str> = text.split_whitespace().collect();
         if words.len() < 2 {
@@ -193,24 +206,39 @@ impl Corrector {
         }
 
         let last = words[words.len() - 1].to_lowercase();
-        if !FEMININE_STREET_TYPES.contains(&last.as_str()) {
-            return text.to_string();
-        }
 
-        // Проверяем предпоследнее слово — оно должно быть прилагательным
-        // в родительном падеже (оканчивается на -ой или -ей)
+        // Определяем род типа улицы
+        let gender = if FEMININE_STREET_TYPES.contains(&last.as_str()) {
+            'f'
+        } else if MASCULINE_STREET_TYPES.contains(&last.as_str()) {
+            'm'
+        } else if NEUTER_STREET_TYPES.contains(&last.as_str()) {
+            'n'
+        } else {
+            return text.to_string();
+        };
+
         let adj = words[words.len() - 2];
         let adj_lower = adj.to_lowercase();
 
-        let corrected_adj = if adj_lower.ends_with("ой") && adj_lower.len() > 3 {
-            // «Калининградской» → «Калининградская»
-            // Важно: отрезаем последние 2 символа (не байта!) — кириллица multibyte
-            let stem: String = adj.chars().take(adj.chars().count() - 2).collect();
-            format!("{}ая", stem)
-        } else if adj_lower.ends_with("ей") && adj_lower.len() > 3 {
-            // «Синей» → «Синяя»
-            let stem: String = adj.chars().take(adj.chars().count() - 2).collect();
-            format!("{}яя", stem)
+        let corrected_adj = if let Some(stem) = try_strip_ending(&adj_lower, "ой") {
+            // -ой: твёрдая или мягкая основа
+            let stem_chars: Vec<char> = stem.chars().collect();
+            let soft = stem_chars.last().map_or(false, |c| *c == 'к');
+            match gender {
+                'f' => format_adj(&adj, &stem, if soft { "ая" } else { "ая" }),
+                'm' => format_adj(&adj, &stem, if soft { "ий" } else { "ый" }),
+                'n' => format_adj(&adj, &stem, if soft { "ое" } else { "ое" }),
+                _ => unreachable!(),
+            }
+        } else if let Some(stem) = try_strip_ending(&adj_lower, "ей") {
+            // -ей: всегда мягкая основа
+            match gender {
+                'f' => format_adj(&adj, &stem, "яя"),
+                'm' => format_adj(&adj, &stem, "ий"),
+                'n' => format_adj(&adj, &stem, "ее"),
+                _ => unreachable!(),
+            }
         } else {
             return text.to_string();
         };
@@ -223,6 +251,27 @@ impl Corrector {
         result.push(words[words.len() - 1].to_string());
         result.join(" ")
     }
+}
+
+/// Проверить, заканчивается ли слово на указанное окончание (по символам).
+/// Возвращает основу (без окончания), если да.
+fn try_strip_ending(lower: &str, ending: &str) -> Option<String> {
+    if lower.len() <= ending.len() || !lower.ends_with(ending) {
+        return None;
+    }
+    let chars: Vec<char> = lower.chars().collect();
+    let stem: String = chars[..chars.len() - ending.chars().count()]
+        .iter()
+        .collect();
+    Some(stem)
+}
+
+/// Склеить основу из оригинального слова (с сохранением регистра) и новое окончание.
+fn format_adj(original: &str, lower_stem: &str, new_ending: &str) -> String {
+    let orig_chars: Vec<char> = original.chars().collect();
+    let stem_len = lower_stem.chars().count();
+    let orig_stem: String = orig_chars[..stem_len].iter().collect();
+    format!("{}{}", orig_stem, new_ending)
 }
 
 /// Скачать словарь по URL и сохранить локально.
