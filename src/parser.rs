@@ -62,6 +62,28 @@ impl PbfParser {
         self
     }
 
+    /// Быстрый проход по PBF: собрать place/landuse-типы для всех именованных мест.
+    fn collect_place_types(&mut self, path: &Path) -> Result<()> {
+        let reader = ElementReader::from_path(path)?;
+        reader.for_each(|element| {
+            let tags: HashMap<String, String> = match &element {
+                Element::Node(n) => n.tags().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+                Element::DenseNode(n) => n.tags().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+                Element::Way(w) => w.tags().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+                Element::Relation(r) => r.tags().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            };
+            if let Some(place_name) = tags.get("name").or_else(|| tags.get("name:ru")) {
+                if let Some(place_type) = place_type_label(&tags) {
+                    self.place_types
+                        .entry(place_name.to_string())
+                        .or_insert(place_type);
+                }
+            }
+        })?;
+        info!("Собрано типов мест: {}", self.place_types.len());
+        Ok(())
+    }
+
     #[allow(dead_code)]
     pub fn new_no_way_coords() -> Self {
         Self {
@@ -73,6 +95,9 @@ impl PbfParser {
     /// Разобрать PBF-файл и вернуть вектор GeoObject.
     pub fn parse_file(&mut self, path: &Path) -> Result<Vec<GeoObject>> {
         info!("Парсинг PBF-файла: {:?}", path);
+
+        // Предварительный проход: собираем типы населённых пунктов
+        self.collect_place_types(path)?;
 
         let file_size = std::fs::metadata(path)
             .map(|m| m.len())
@@ -251,15 +276,6 @@ impl PbfParser {
 
         let has_name = tags.contains_key("name") || tags.contains_key("name:ru");
 
-        // Запоминаем тип населённого пункта (place/landuse) для адресов без улиц
-        if let Some(place_name) = tags.get("name").or_else(|| tags.get("name:ru")) {
-            if let Some(place_type) = place_type_label(tags) {
-                self.place_types
-                    .entry(place_name.to_string())
-                    .or_insert(place_type);
-            }
-        }
-
         if has_address
             && let Some(addr) = extract_address(tags, lat, lon, self.corrector.as_ref(), &self.place_types)
         {
@@ -336,6 +352,9 @@ fn place_type_label(tags: &HashMap<String, String>) -> Option<String> {
             "locality" => return Some("урочище".into()),
             "suburb" => return Some("микрорайон".into()),
             "neighbourhood" => return Some("квартал".into()),
+            "town" => return Some("город".into()),
+            "city" => return Some("город".into()),
+            "borough" => return Some("район".into()),
             _ => {}
         }
     }
