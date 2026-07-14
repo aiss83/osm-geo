@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::io::Write;
 
 use crate::model::GeoObject;
+use crate::corrector::Corrector;
 
 /// Заголовок файла (88 байт, little-endian).
 #[repr(C, packed)]
@@ -189,12 +190,12 @@ impl CompactWriter {
             let (lat, lon) = obj.lat_lon();
             let record = match obj {
                 GeoObject::Address(addr) => {
-                    let city_idx = self.pool.intern(addr.city.as_deref());
-                    let street_idx = self.pool.intern(addr.street.as_deref());
-                    let hn_idx = self.pool.intern(addr.housenumber.as_deref());
+                    let city_idx = self.pool.intern(addr.city.as_deref().map(|s| Corrector::normalize_chars(s)).as_deref());
+                    let street_idx = self.pool.intern(addr.street.as_deref().map(|s| Corrector::normalize_chars(s)).as_deref());
+                    let hn_idx = self.pool.intern(addr.housenumber.as_deref().map(|s| Corrector::normalize_chars(s)).as_deref());
                     // Интернируем страну и индекс — не храним, но они нужны для полноты пула
-                    self.pool.intern(addr.country.as_deref());
-                    self.pool.intern(addr.postcode.as_deref());
+                    self.pool.intern(addr.country.as_deref().map(|s| Corrector::normalize_chars(s)).as_deref());
+                    self.pool.intern(addr.postcode.as_deref().map(|s| Corrector::normalize_chars(s)).as_deref());
 
                     RecordEntry {
                         obj_type: 0,
@@ -205,8 +206,8 @@ impl CompactWriter {
                     }
                 }
                 GeoObject::Named(obj) => {
-                    let name_idx = self.pool.intern(Some(&obj.name));
-                    let translit_idx = self.pool.intern(obj.translit.as_deref());
+                    let name_idx = self.pool.intern(Some(&Corrector::normalize_chars(&obj.name)));
+                    let translit_idx = self.pool.intern(obj.translit.as_deref().map(|s| Corrector::normalize_chars(s)).as_deref());
                     let category = category_to_tag(obj.category.as_deref());
 
                     RecordEntry {
