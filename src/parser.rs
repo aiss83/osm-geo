@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::model::{Address, GeoObject, NamedObject};
+use crate::corrector::Corrector;
 
 /// Парсер PBF-файлов OSM.
 pub struct PbfParser {
@@ -31,6 +32,8 @@ pub struct PbfParser {
     /// Статистика: сколько way получили реальные координаты.
     ways_resolved: u64,
     ways_unresolved: u64,
+    /// Опциональный корректор опечаток (SymSpell).
+    corrector: Option<Corrector>,
 }
 
 impl PbfParser {
@@ -45,7 +48,15 @@ impl PbfParser {
             resolve_way_coords: true,
             ways_resolved: 0,
             ways_unresolved: 0,
+            corrector: None,
         }
+    }
+
+    /// Включить коррекцию опечаток (SymSpell).
+    /// Словарь загружается из `data/ru_full.txt` (скачивается при необходимости).
+    pub fn with_corrector(mut self, corrector: Corrector) -> Self {
+        self.corrector = Some(corrector);
+        self
     }
 
     #[allow(dead_code)]
@@ -188,7 +199,7 @@ impl PbfParser {
 
         match rel_type {
             Some("boundary") if tags.get("boundary") == Some(&"administrative".to_string()) => {
-                if let Some(obj) = extract_named_object(tags, 0.0, 0.0) {
+                if let Some(obj) = extract_named_object(tags, 0.0, 0.0, self.corrector.as_ref()) {
                     let admin_level = tags.get("admin_level").cloned();
                     let mut obj = obj;
                     if admin_level.is_some() && obj.category.is_none() {
@@ -209,14 +220,14 @@ impl PbfParser {
                     if let Some(city) = tags.get("addr:city") {
                         addr_tags.insert("addr:city".to_string(), city.clone());
                     }
-                    if let Some(addr) = extract_address(&addr_tags, 0.0, 0.0) {
+                    if let Some(addr) = extract_address(&addr_tags, 0.0, 0.0, self.corrector.as_ref()) {
                         objects.push(GeoObject::Address(addr));
                         self.addresses += 1;
                     }
                 }
             }
             _ => {
-                if let Some(obj) = extract_named_object(tags, 0.0, 0.0) {
+                if let Some(obj) = extract_named_object(tags, 0.0, 0.0, self.corrector.as_ref()) {
                     objects.push(GeoObject::Named(obj));
                     self.named_objects += 1;
                 }
@@ -238,14 +249,14 @@ impl PbfParser {
         let has_name = tags.contains_key("name") || tags.contains_key("name:ru");
 
         if has_address
-            && let Some(addr) = extract_address(tags, lat, lon)
+            && let Some(addr) = extract_address(tags, lat, lon, self.corrector.as_ref())
         {
             objects.push(GeoObject::Address(addr));
             self.addresses += 1;
         }
 
         if has_name
-            && let Some(obj) = extract_named_object(tags, lat, lon)
+            && let Some(obj) = extract_named_object(tags, lat, lon, self.corrector.as_ref())
         {
             objects.push(GeoObject::Named(obj));
             self.named_objects += 1;
@@ -265,14 +276,16 @@ impl PbfParser {
 }
 
 /// Извлечь Address из тегов.
-fn extract_address(tags: &HashMap<String, String>, lat: f64, lon: f64) -> Option<Address> {
+fn extract_address(tags: &HashMap<String, String>, lat: f64, lon: f64, corrector: Option<&Corrector>) -> Option<Address> {
     let country = tags.get("addr:country").cloned();
-    let city = tags
-        .get("addr:city")
-        .or_else(|| tags.get("addr:town"))
-        .or_else(|| tags.get("addr:place"))
-        .cloned();
-    let street = tags.get("addr:street").cloned();
+    let city = correct_field(
+        tags.get("addr:city")
+            .or_else(|| tags.get("addr:town"))
+            .or_else(|| tags.get("addr:place"))
+            .cloned(),
+        corrector,
+    );
+    let street = correct_field(tags.get("addr:street").cloned(), corrector);
     let housenumber = tags.get("addr:housenumber").cloned();
     let postcode = tags.get("addr:postcode").cloned();
 
@@ -291,12 +304,27 @@ fn extract_address(tags: &HashMap<String, String>, lat: f64, lon: f64) -> Option
     })
 }
 
+/// Применить корректор к полю, если оно задано и корректор доступен.
+/// Сначала исправляет опечатки, затем нормализует регистр.
+fn correct_field(value: Option<String>, corrector: Option<&Corrector>) -> Option<String> {
+    match (value, corrector) {
+        (Some(v), Some(c)) => {
+            let corrected = c.correct(&v);
+            let normalized = Corrector::normalize_case(&corrected);
+            Some(normalized)
+        }
+        (v, _) => v,
+    }
+}
+
 /// Извлечь NamedObject из тегов. Только русское имя + транслитерация.
-fn extract_named_object(tags: &HashMap<String, String>, lat: f64, lon: f64) -> Option<NamedObject> {
-    let name = tags
-        .get("name:ru")
-        .or_else(|| tags.get("name"))
-        .cloned()?;
+fn extract_named_object(tags: &HashMap<String, String>, lat: f64, lon: f64, corrector: Option<&Corrector>) -> Option<NamedObject> {
+    let name = correct_field(
+        tags.get("name:ru")
+            .or_else(|| tags.get("name"))
+            .cloned(),
+        corrector,
+    )?;
 
     let category = tags
         .get("amenity")
@@ -335,7 +363,7 @@ mod tests {
         tags.insert("addr:street".to_string(), "Тверская".to_string());
         tags.insert("addr:housenumber".to_string(), "1".to_string());
 
-        let addr = extract_address(&tags, 55.7558, 37.6173).unwrap();
+        let addr = extract_address(&tags, 55.7558, 37.6173, None).unwrap();
         assert_eq!(addr.city.unwrap(), "Москва");
         assert_eq!(addr.street.unwrap(), "Тверская");
     }
@@ -344,13 +372,13 @@ mod tests {
     fn test_extract_address_no_city_no_street() {
         let mut tags = HashMap::new();
         tags.insert("addr:housenumber".to_string(), "1".to_string());
-        assert!(extract_address(&tags, 0.0, 0.0).is_none());
+        assert!(extract_address(&tags, 0.0, 0.0, None).is_none());
     }
 
     #[test]
     fn test_extract_named_object_no_name() {
         let tags = HashMap::new();
-        assert!(extract_named_object(&tags, 0.0, 0.0).is_none());
+        assert!(extract_named_object(&tags, 0.0, 0.0, None).is_none());
     }
 
     #[test]
@@ -364,7 +392,7 @@ mod tests {
         let mut tags = HashMap::new();
         tags.insert("name:ru".to_string(), "Красная площадь".to_string());
         tags.insert("amenity".to_string(), "tourism".to_string());
-        let obj = extract_named_object(&tags, 55.75, 37.62).unwrap();
+        let obj = extract_named_object(&tags, 55.75, 37.62, None).unwrap();
         assert_eq!(obj.name, "Красная площадь");
         assert_eq!(obj.category.unwrap(), "tourism");
         // Кириллическое имя → транслитерация должна быть
@@ -375,7 +403,7 @@ mod tests {
     fn test_extract_named_object_fallback_to_name() {
         let mut tags = HashMap::new();
         tags.insert("name".to_string(), "Red Square".to_string());
-        let obj = extract_named_object(&tags, 0.0, 0.0).unwrap();
+        let obj = extract_named_object(&tags, 0.0, 0.0, None).unwrap();
         assert_eq!(obj.name, "Red Square");
         // Латиница → транслитерации нет
         assert!(obj.translit.is_none());
@@ -386,7 +414,7 @@ mod tests {
         let mut tags = HashMap::new();
         tags.insert("name".to_string(), "Test".to_string());
         tags.insert("amenity".to_string(), "cafe".to_string());
-        let obj = extract_named_object(&tags, 0.0, 0.0).unwrap();
+        let obj = extract_named_object(&tags, 0.0, 0.0, None).unwrap();
         assert_eq!(obj.category.unwrap(), "cafe");
     }
 }

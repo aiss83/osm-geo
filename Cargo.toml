@@ -24,6 +24,8 @@ sha2 = "0.10"
 reqwest = { version = "0.12", features = ["blocking"] }
 # Russian stemming
 rust-stemmers = "1"
+# Spell correction (SymSpell)
+symspell = "0.5"
 # HTML parsing
 regex-lite = "0.1"
 # Error handling

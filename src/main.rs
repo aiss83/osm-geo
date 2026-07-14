@@ -6,6 +6,7 @@
 //!   info    — вывод метаданных о базе
 
 mod compact;
+mod corrector;
 mod dedup;
 mod downloader;
 mod finalizer;
@@ -135,7 +136,16 @@ fn cmd_build(
     info!("Выходной файл: {:?}", output_path);
 
     // 3. Парсинг PBF
+    let corrector = corrector::Corrector::new_or_download()
+        .map_err(|e| {
+            log::warn!("Не удалось загрузить корректор опечаток: {} (продолжаем без коррекции)", e);
+            e
+        })
+        .ok();
     let mut parser = parser::PbfParser::new();
+    if let Some(c) = corrector {
+        parser = parser.with_corrector(c);
+    }
     let objects = parser.parse_file(&input_path)?;
     info!("Извлечено {} объектов", objects.len());
 
