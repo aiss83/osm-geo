@@ -326,7 +326,8 @@ fn extract_address(tags: &HashMap<String, String>, lat: f64, lon: f64, corrector
         }
     }
 
-    if city.is_none() && (street.is_none() || housenumber.is_none()) {
+    // Требуем улицу и номер дома; адреса без улицы не включаем
+    if street.is_none() || housenumber.is_none() {
         return None;
     }
 
