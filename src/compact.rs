@@ -1,6 +1,6 @@
 //! Компактный бинарный формат для мобильных устройств.
 //!
-//! Замена SQLite: в 6-8× компактнее за счёт:
+//! Замена SQLite: в 4-6× компактнее за счёт:
 //! - Словарного кодирования строк (String pool)
 //! - Сортированных массивов для бинарного поиска
 //! - Отсутствия накладных расходов SQLite
@@ -245,12 +245,14 @@ impl CompactWriter {
             }
         }
 
-        // Сортируем Named Index по тексту имени (из пула)
+        // Сортируем Named Index по тексту имени (из пула), case-insensitive
+        // для поддержки регистронезависимого бинарного поиска.
+        // Потребитель обязан lowercasing-ить запрос и строку пула при сравнении.
         let pool = &self.pool;
         self.named_index.sort_by(|a, b| {
             let name_a = &pool.strings[a.name_idx as usize];
             let name_b = &pool.strings[b.name_idx as usize];
-            name_a.cmp(name_b)
+            name_a.to_lowercase().cmp(&name_b.to_lowercase())
         });
 
         info!("Named Index: {} записей", self.named_index.len());
@@ -267,20 +269,24 @@ impl CompactWriter {
             }
         }
 
+        // Сортируем Address Index по (city, street, housenumber), case-insensitive
+        // для поддержки регистронезависимого бинарного поиска.
+        // Потребитель обязан lowercasing-ить запрос и строки пула при сравнении.
         self.addr_index.sort_by(|a, b| {
             let city_a = &pool.strings[a.city_idx as usize];
             let city_b = &pool.strings[b.city_idx as usize];
             city_a
-                .cmp(city_b)
+                .to_lowercase()
+                .cmp(&city_b.to_lowercase())
                 .then_with(|| {
                     let street_a = &pool.strings[a.street_idx as usize];
                     let street_b = &pool.strings[b.street_idx as usize];
-                    street_a.cmp(street_b)
+                    street_a.to_lowercase().cmp(&street_b.to_lowercase())
                 })
                 .then_with(|| {
                     let hn_a = &pool.strings[a.housenumber_idx as usize];
                     let hn_b = &pool.strings[b.housenumber_idx as usize];
-                    hn_a.cmp(hn_b)
+                    hn_a.to_lowercase().cmp(&hn_b.to_lowercase())
                 })
         });
 

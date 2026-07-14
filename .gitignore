@@ -8,3 +8,4 @@
 *.osm.pbf
 *.osm.pbf.gz
 *.osm.pbf.zst
+.DS_Store

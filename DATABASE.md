@@ -59,7 +59,7 @@ CREATE TABLE objects (
     -- NamedObject fields (type = 1)
     name         TEXT,
     translit     TEXT,
-    category     TEXT,
+    category     TEXT
 );
 ```
 
@@ -454,8 +454,8 @@ osm-geo build --input russia/central-fed-district --format compact --output cfd.
 type:     u8      — 0=Address, 1=Named
 lat:      f32
 lon:      f32
-Address:  city_idx:u16, street_idx:u16, housenumber_idx:u16   (9 байт)
-Named:    name_idx:u16, translit_idx:u16, category:u8         (6 байт)
+Address:  city_idx:u16, street_idx:u16, housenumber_idx:u16   (6 байт, 2+2+2)
+Named:    name_idx:u16, translit_idx:u16, category:u8         (5 байт, 2+2+1)
 ```
 
 **Named Index** (сортирован по строке имени):
@@ -488,6 +488,291 @@ record_idx:       u32
 |--------|-----------|------|
 | SQLite | 434 MB | 160 MB |
 | Compact | 71 MB | 35 MB |
+
+### 9.7. Пример C-структур для чтения
+
+Ниже — компактное определение всех структур бинарного формата на C.
+Все поля little-endian, выравнивание отключено (`#pragma pack`), чтобы
+побайтово совпадать с тем, что записывает `compact.rs`.
+
+```c
+#pragma pack(push, 1)
+
+/* ── Заголовок файла (88 байт) ─────────────────────────────────────── */
+typedef struct {
+    uint8_t  magic[4];           /* 0x4F 0x53 0x4D 0x47 = "OSMG"       */
+    uint16_t version;            /* версия формата (1)                   */
+    uint32_t record_count;       /* общее количество объектов            */
+    uint32_t addr_count;         /* количество адресов                   */
+    uint32_t named_count;        /* количество POI                      */
+    uint64_t build_timestamp;    /* Unix timestamp секунд сборки         */
+    uint8_t  region[46];         /* код региона UTF-8, zero-padded       */
+    uint32_t string_pool_offset;
+    uint32_t named_index_offset;
+    uint32_t addr_index_offset;
+    uint32_t records_offset;
+} Header;
+
+/* ── Запись в Named Index (9 байт) ─────────────────────────────────── */
+typedef struct {
+    uint16_t name_idx;           /* индекс строки имени в String Pool     */
+    uint16_t translit_idx;       /* индекс строки транслитерации          */
+    uint8_t  category;           /* тег категории (1=Amenity, …)          */
+    uint32_t record_idx;         /* индекс в Record Block                 */
+} NamedIndexEntry;
+
+/* ── Запись в Address Index (10 байт) ──────────────────────────────── */
+typedef struct {
+    uint16_t city_idx;           /* индекс строки города                  */
+    uint16_t street_idx;         /* индекс строки улицы                   */
+    uint16_t housenumber_idx;    /* индекс строки номера дома             */
+    uint32_t record_idx;         /* индекс в Record Block                 */
+} AddrIndexEntry;
+
+/* ── Запись в Record Block (9 или 8 байт после type+lat+lon) ──────── */
+typedef struct {
+    uint16_t city_idx;
+    uint16_t street_idx;
+    uint16_t housenumber_idx;
+} RecordAddr;                    /* поля Address-записи (6 байт)          */
+
+typedef struct {
+    uint16_t name_idx;
+    uint16_t translit_idx;
+    uint8_t  category;
+} RecordNamed;                   /* поля Named-записи (5 байт)            */
+
+#pragma pack(pop)
+```
+
+**Чтение Record Block.** Каждая запись начинается одинаково — `type`,
+`lat`, `lon` — а дальше, в зависимости от `type`, читается либо
+`RecordAddr`, либо `RecordNamed`:
+
+```c
+/* Прочитать все записи из уже загруженного в память Record Block */
+void read_records(const uint8_t *data, const Header *hdr) {
+    const uint8_t *ptr = data + hdr->records_offset;
+    uint32_t count;
+    memcpy(&count, ptr, 4);  ptr += 4;   /* первое u32 — количество записей */
+
+    for (uint32_t i = 0; i < count; i++) {
+        uint8_t   type = *ptr;        ptr += 1;
+        float     lat, lon;
+        memcpy(&lat, ptr, 4);  ptr += 4;
+        memcpy(&lon, ptr, 4);  ptr += 4;
+
+        if (type == 0) {
+            /* Address */
+            RecordAddr addr;
+            memcpy(&addr, ptr, sizeof(RecordAddr));
+            ptr += sizeof(RecordAddr);
+            /* addr.city_idx, addr.street_idx, addr.housenumber_idx → String Pool */
+        } else if (type == 1) {
+            /* NamedObject */
+            RecordNamed named;
+            memcpy(&named, ptr, sizeof(RecordNamed));
+            ptr += sizeof(RecordNamed);
+            /* named.name_idx, named.translit_idx, named.category → String Pool */
+        }
+    }
+}
+```
+
+**Чтение String Pool.** Пул строк начинается сразу после заголовка.
+Формат: `u32 count`, затем для каждой строки `u16 len` + `len` байт UTF-8.
+
+```c
+/* Прочитать все строки из String Pool; вернуть массив указателей и их количество */
+const char **read_string_pool(const uint8_t *data, const Header *hdr,
+                              uint32_t *out_count) {
+    const uint8_t *ptr = data + hdr->string_pool_offset;
+    uint32_t count;
+    memcpy(&count, ptr, 4);  ptr += 4;
+
+    const char **pool = malloc(count * sizeof(const char *));
+    for (uint32_t i = 0; i < count; i++) {
+        uint16_t len;
+        memcpy(&len, ptr, 2);  ptr += 2;
+        pool[i] = (const char *)ptr;
+        ptr += len;
+    }
+    *out_count = count;
+    return pool;
+}
+```
+
+**Открытие файла целиком.** Рекомендуемый способ — mmap:
+
+```c
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <stdint.h>
+#include <string.h>
+
+int main(int argc, char *argv[]) {
+    int fd = open(argv[1], O_RDONLY);
+    struct stat st;
+    fstat(fd, &st);
+    const uint8_t *data = mmap(NULL, st.st_size, PROT_READ,
+                                MAP_PRIVATE, fd, 0);
+
+    const Header *hdr = (const Header *)data;
+
+    /* проверка magic */
+    if (memcmp(hdr->magic, "OSMG", 4) != 0) return 1;
+
+    uint32_t      sp_count;
+    const char  **pool = read_string_pool(data, hdr, &sp_count);
+
+    /* разрешить city_idx → название */
+    const char *city_name = pool[3];  /* например */
+
+    read_records(data, hdr);
+
+    munmap((void *)data, st.st_size);
+    close(fd);
+    return 0;
+}
+```
+
+**Бинарный поиск по Named Index.** Named Index отсортирован лексикографически
+по строкам имени **без учёта регистра** (case-insensitive, Unicode lowercasing).
+Текст берётся из String Pool по `name_idx`.
+
+Потребитель выполняет `bsearch` или собственный бинарный поиск,
+**обязательно приводя к нижнему регистру и запрос, и строку из пула**:
+
+```c
+/* Case-insensitive сравнение: и запрос, и строка пула — в нижнем регистре.
+   Реализация для UTF-8 должна корректно обрабатывать кириллицу. */
+static int named_cmp(const void *key, const void *entry) {
+    const char          *query = (const char *)key;
+    const NamedIndexEntry *e   = (const NamedIndexEntry *)entry;
+    const char *name = string_pool[e->name_idx];  /* pool — глобальный */
+    return utf8_casefold_cmp(query, name);  /* case-insensitive strcmp для UTF-8 */
+}
+
+/* Бинарный поиск в Named Index. query должен быть уже в нижнем регистре. */
+NamedIndexEntry *find_named(const char *query, NamedIndexEntry *named_base,
+                            uint32_t named_count) {
+    return bsearch(query, named_base, named_count,
+                   sizeof(NamedIndexEntry), named_cmp);
+}
+```
+
+**Важно:** Named Index сортирован по **полному** имени (case-insensitive).
+Для префиксного поиска (например, «красн» → «Красная площадь») потребитель
+должен выполнить бинарный поиск до первого вхождения, а затем линейно
+сканировать вперёд до изменения префикса. И запрос, и строки пула
+сравниваются в нижнем регистре.
+
+### 9.8. Типовые ошибки при реализации ридера
+
+#### 9.8.1. Выравнивание структур (struct padding)
+
+**Самая частая ошибка.** Без `#pragma pack` компилятор C вставляет
+padding-байты между полями разного размера. Например, `NamedIndexEntry`
+без упаковки компилируется в 12 байт вместо 9 — три лишних байта между
+`category` (u8) и `record_idx` (u32). В результате `record_idx` читает
+мусор из следующей записи.
+
+**Проверка:** распечатайте `sizeof(NamedIndexEntry)`. Должно быть **9**,
+не 12. Для `AddrIndexEntry` — **10**, не 12.
+
+```c
+/* Правильно */
+#pragma pack(push, 1)
+typedef struct { uint16_t name_idx; uint16_t translit_idx;
+                 uint8_t category; uint32_t record_idx; } NamedIndexEntry;
+#pragma pack(pop)
+/* sizeof(NamedIndexEntry) == 9 */
+
+/* Неправильно — без pack, sizeof == 12 */
+typedef struct { uint16_t name_idx; uint16_t translit_idx;
+                 uint8_t category; uint32_t record_idx; } NamedIndexEntry;
+```
+
+#### 9.8.2. Record Block — записи переменной длины
+
+Record Block содержит записи **разного размера**:
+
+| Тип | Байт |
+|-----|------|
+| Address (type=0) | 1 (type) + 4 (lat) + 4 (lon) + 2+2+2 (city,street,hn) = **15 байт** |
+| Named (type=1)   | 1 (type) + 4 (lat) + 4 (lon) + 2+2+1 (name,translit,cat) = **14 байт** |
+
+**`record_idx` в Named Index и Address Index — это логический номер
+записи (0-based), а НЕ байтовое смещение!** Нельзя вычислить позицию
+как `base + idx * sizeof(RecordEntry)` — записи Address и Named имеют
+разную длину.
+
+Для произвольного доступа по `record_idx` нужно либо:
+- Пройти Record Block **последовательно** от начала до нужного номера,
+- **Построить lookup-таблицу** байтовых смещений при загрузке файла.
+
+```c
+/* Построение таблицы смещений Record Block за один проход */
+uint32_t *build_record_offsets(const uint8_t *data, const Header *hdr,
+                               uint32_t *out_count) {
+    uint32_t count;
+    memcpy(&count, data + hdr->records_offset, 4);
+    uint32_t *offsets = malloc(count * sizeof(uint32_t));
+    const uint8_t *ptr = data + hdr->records_offset + 4;
+    for (uint32_t i = 0; i < count; i++) {
+        offsets[i] = (uint32_t)(ptr - data);  /* байтовое смещение */
+        uint8_t type = *ptr;
+        ptr += 1 + 8;  /* type + lat + lon */
+        ptr += (type == 0) ? 6 : 5;  /* поля адреса или POI */
+    }
+    *out_count = count;
+    return offsets;
+}
+
+/* Произвольный доступ: чтение записи по record_idx */
+void read_record_by_idx(const uint8_t *data, uint32_t *offsets, uint32_t idx) {
+    const uint8_t *ptr = data + offsets[idx];
+    uint8_t  type = *ptr;
+    float    lat, lon;
+    memcpy(&lat, ptr + 1, 4);
+    memcpy(&lon, ptr + 5, 4);
+    /* ... чтение полей в зависимости от type ... */
+}
+```
+
+#### 9.8.3. Нулевые координаты у первых записей
+
+Record Block отсортирован по `(lat, lon)`. Первыми идут объекты с
+координатами `(0.0, 0.0)` — это OSM-отношения (маршруты дорог,
+административные границы), у которых нет точечных координат. Их
+немного (десятки-сотни на регион). Нулевые координаты — не ошибка
+формата, а особенность данных.
+
+#### 9.8.4. Диагностика: проверка файла скриптом
+
+Быстрая проверка целостности `.bin`-файла Python-скриптом:
+
+```python
+import struct, sys
+with open(sys.argv[1], 'rb') as f:
+    data = f.read()
+magic, ver, total = struct.unpack_from('<4sHI', data, 0)[:3]
+sp_off, ni_off, ai_off, rec_off = struct.unpack_from('<IIII', data, 72)
+print(f'Magic={magic} ver={ver} total={total}')
+print(f'Sizes: SP={ni_off-sp_off}, NI={ai_off-ni_off}, AI={rec_off-ai_off}')
+
+# Проверка Named Index (9 байт на запись, БЕЗ padding)
+ni_count = struct.unpack_from('<I', data, ni_off)[0]
+pos = ni_off + 4
+for i in range(5):
+    name_idx, _, _, rec_idx = struct.unpack_from('<HHBI', data, pos)
+    print(f'  NI[{i}]: name_idx={name_idx} rec_idx={rec_idx}')
+    pos += 9
+assert ni_count * 9 + 4 == ai_off - ni_off, 'Named Index size mismatch!'
+print('Named Index: OK')
+```
 
 ---
 
