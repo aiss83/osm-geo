@@ -34,6 +34,8 @@ pub struct PbfParser {
     ways_unresolved: u64,
     /// Опциональный корректор опечаток (SymSpell).
     corrector: Option<Corrector>,
+    /// Типы населённых пунктов: название → описание (СНТ, посёлок, ...)
+    place_types: HashMap<String, String>,
 }
 
 impl PbfParser {
@@ -49,6 +51,7 @@ impl PbfParser {
             ways_resolved: 0,
             ways_unresolved: 0,
             corrector: None,
+            place_types: HashMap::new(),
         }
     }
 
@@ -220,7 +223,7 @@ impl PbfParser {
                     if let Some(city) = tags.get("addr:city") {
                         addr_tags.insert("addr:city".to_string(), city.clone());
                     }
-                    if let Some(addr) = extract_address(&addr_tags, 0.0, 0.0, self.corrector.as_ref()) {
+                    if let Some(addr) = extract_address(&addr_tags, 0.0, 0.0, self.corrector.as_ref(), &self.place_types) {
                         objects.push(GeoObject::Address(addr));
                         self.addresses += 1;
                     }
@@ -248,8 +251,17 @@ impl PbfParser {
 
         let has_name = tags.contains_key("name") || tags.contains_key("name:ru");
 
+        // Запоминаем тип населённого пункта (place/landuse) для адресов без улиц
+        if let Some(place_name) = tags.get("name").or_else(|| tags.get("name:ru")) {
+            if let Some(place_type) = place_type_label(tags) {
+                self.place_types
+                    .entry(place_name.to_string())
+                    .or_insert(place_type);
+            }
+        }
+
         if has_address
-            && let Some(addr) = extract_address(tags, lat, lon, self.corrector.as_ref())
+            && let Some(addr) = extract_address(tags, lat, lon, self.corrector.as_ref(), &self.place_types)
         {
             objects.push(GeoObject::Address(addr));
             self.addresses += 1;
@@ -276,7 +288,7 @@ impl PbfParser {
 }
 
 /// Извлечь Address из тегов.
-fn extract_address(tags: &HashMap<String, String>, lat: f64, lon: f64, corrector: Option<&Corrector>) -> Option<Address> {
+fn extract_address(tags: &HashMap<String, String>, lat: f64, lon: f64, corrector: Option<&Corrector>, place_types: &HashMap<String, String>) -> Option<Address> {
     let country = tags.get("addr:country").cloned();
     let city = correct_field(
         tags.get("addr:city")
@@ -285,9 +297,18 @@ fn extract_address(tags: &HashMap<String, String>, lat: f64, lon: f64, corrector
             .cloned(),
         corrector,
     );
-    let street = correct_field(tags.get("addr:street").cloned(), corrector);
+    let mut street = correct_field(tags.get("addr:street").cloned(), corrector);
     let housenumber = tags.get("addr:housenumber").cloned();
     let postcode = tags.get("addr:postcode").cloned();
+
+    // Если улицы нет, пробуем подставить тип населённого пункта
+    if street.is_none() {
+        if let Some(ref city_name) = city {
+            if let Some(place_desc) = place_types.get(city_name) {
+                street = Some(format!("{} {}", place_desc, city_name));
+            }
+        }
+    }
 
     if city.is_none() && (street.is_none() || housenumber.is_none()) {
         return None;
@@ -302,6 +323,26 @@ fn extract_address(tags: &HashMap<String, String>, lat: f64, lon: f64, corrector
         lat,
         lon,
     })
+}
+
+/// Определить русское описание типа населённого пункта по OSM-тегам.
+fn place_type_label(tags: &HashMap<String, String>) -> Option<String> {
+    if let Some(place) = tags.get("place") {
+        match place.as_str() {
+            "allotments" => return Some("СНТ".into()),
+            "hamlet" => return Some("посёлок".into()),
+            "village" => return Some("деревня".into()),
+            "isolated_dwelling" => return Some("хутор".into()),
+            "locality" => return Some("урочище".into()),
+            "suburb" => return Some("микрорайон".into()),
+            "neighbourhood" => return Some("квартал".into()),
+            _ => {}
+        }
+    }
+    if tags.get("landuse").map(|s| s.as_str()) == Some("allotments") {
+        return Some("СНТ".into());
+    }
+    None
 }
 
 /// Применить корректор к полю, если оно задано и корректор доступен.
@@ -364,7 +405,7 @@ mod tests {
         tags.insert("addr:street".to_string(), "Тверская".to_string());
         tags.insert("addr:housenumber".to_string(), "1".to_string());
 
-        let addr = extract_address(&tags, 55.7558, 37.6173, None).unwrap();
+        let addr = extract_address(&tags, 55.7558, 37.6173, None, &HashMap::new()).unwrap();
         assert_eq!(addr.city.unwrap(), "Москва");
         assert_eq!(addr.street.unwrap(), "Тверская");
     }
@@ -373,7 +414,7 @@ mod tests {
     fn test_extract_address_no_city_no_street() {
         let mut tags = HashMap::new();
         tags.insert("addr:housenumber".to_string(), "1".to_string());
-        assert!(extract_address(&tags, 0.0, 0.0, None).is_none());
+        assert!(extract_address(&tags, 0.0, 0.0, None, &HashMap::new()).is_none());
     }
 
     #[test]
