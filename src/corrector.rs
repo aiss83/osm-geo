@@ -39,6 +39,7 @@ const STREET_TYPE_PREFIXES: &[&str] = &[
     "тракт",
     "мост",
     "канал",
+    "съезд",
 ];
 
 /// Типы улиц женского рода — если прилагательное перед ними
@@ -52,6 +53,7 @@ const FEMININE_STREET_TYPES: &[&str] = &[
 const MASCULINE_STREET_TYPES: &[&str] = &[
     "проспект", "переулок", "бульвар", "проезд", "тупик",
     "вал", "спуск", "подъезд", "тракт", "мост", "канал",
+    "съезд",
 ];
 
 /// Типы улиц среднего рода: -ой→-ое, -ей→-ее.
@@ -152,8 +154,8 @@ impl Corrector {
     }
     /// Исправить опечатки в тексте.
     ///
-    /// Каждое слово проверяется через SymSpell. Слова длиной ≤ 3 символа
-    /// и слова на латинице не корректируются.
+    /// Каждое слово проверяется через SymSpell. Слова длиной ≤ 3 символа,
+    /// слова на латинице, типы улиц и топонимы не корректируются.
     pub fn correct(&self, text: &str) -> String {
         if text.is_empty() {
             return text.to_string();
@@ -170,6 +172,14 @@ impl Corrector {
             }
 
             let lower = word.to_lowercase();
+
+            // Типы улиц — валидные слова, не должны правиться SymSpell
+            // (частотный словарь может не содержать «проспект», предлагая «проспекту»)
+            if is_protected_word(&lower) {
+                corrected.push((*word).to_string());
+                continue;
+            }
+
             let suggestions = self.symspell.lookup(&lower, Verbosity::Closest, 2);
 
             if let Some(sug) = suggestions.first() {
@@ -232,16 +242,18 @@ impl Corrector {
         result.join(" ")
     }
 
-    /// Исправить согласование прилагательного с типом улицы.
+    /// Исправить согласование прилагательного с существительным.
     ///
-    /// В OSM часто встречается «Калининградской улица» (родительный падеж)
-    /// вместо правильного «Калининградская улица» (именительный).
+    /// В OSM часто встречается родительный падеж прилагательного вместо
+    /// именительного: «Калининградской улица» → «Калининградская улица»,
+    /// «Калининградской зоопарк» → «Калининградский зоопарк».
     ///
-    /// Правило: для названий вида `<Прилагательное> <ТипУлицы>` исправляем
-    /// окончание прилагательного на именительный падеж нужного рода:
-    /// - Женский (улица, площадь, ...):  -ой→-ая, -ей→-яя
-    /// - Мужской (проспект, переулок, ...): -ой→-ый/-ий, -ей→-ий
-    /// - Средний (шоссе):                -ой→-ое, -ей→-ее
+    /// Правило: для двух последних слов вида `<Прилагательное> <Существительное>`
+    /// исправляем окончание прилагательного на именительный падеж
+    /// в соответствии с родом существительного:
+    /// - Женский (-а/-я):      -ой→-ая, -ей→-яя
+    /// - Мужской (согласная):  -ой→-ый/-ий, -ей→-ий
+    /// - Средний (-о/-е):      -ой→-ое, -ей→-ее
     pub fn fix_adjective_agreement(text: &str) -> String {
         let words: Vec<&str> = text.split_whitespace().collect();
         if words.len() < 2 {
@@ -249,27 +261,41 @@ impl Corrector {
         }
 
         let last = words[words.len() - 1].to_lowercase();
+        let last_is_cyrillic = contains_cyrillic(&last);
 
-        // Определяем род типа улицы
+        // Определяем род: сначала по типу улицы, затем по окончанию существительного
         let gender = if FEMININE_STREET_TYPES.contains(&last.as_str()) {
-            'f'
+            Some('f')
         } else if MASCULINE_STREET_TYPES.contains(&last.as_str()) {
-            'm'
+            Some('m')
         } else if NEUTER_STREET_TYPES.contains(&last.as_str()) {
-            'n'
+            Some('n')
+        } else if last_is_cyrillic {
+            // Не тип улицы, но кириллическое существительное — определяем род по окончанию
+            detect_noun_gender(&last)
         } else {
-            return text.to_string();
+            None
+        };
+
+        let gender = match gender {
+            Some(g) => g,
+            None => return text.to_string(),
         };
 
         let adj = words[words.len() - 2];
         let adj_lower = adj.to_lowercase();
 
+        // Прилагательное должно содержать кириллицу и быть достаточно длинным
+        if !contains_cyrillic(&adj_lower) || adj_lower.len() < 4 {
+            return text.to_string();
+        }
+
         let corrected_adj = if let Some(stem) = try_strip_ending(&adj_lower, "ой") {
-            // -ой: твёрдая или мягкая основа
+            // -ой: твёрдая или мягкая основа (к/г/х → ий)
             let stem_chars: Vec<char> = stem.chars().collect();
-            let soft = stem_chars.last().map_or(false, |c| *c == 'к');
+            let soft = stem_chars.last().map_or(false, |c| matches!(c, 'к' | 'г' | 'х'));
             match gender {
-                'f' => format_adj(&adj, &stem, if soft { "ая" } else { "ая" }),
+                'f' => format_adj(&adj, &stem, "ая"),
                 'm' => format_adj(&adj, &stem, if soft { "ий" } else { "ый" }),
                 'n' => format_adj(&adj, &stem, if soft { "ое" } else { "ое" }),
                 _ => unreachable!(),
@@ -294,6 +320,31 @@ impl Corrector {
         result.push(words[words.len() - 1].to_string());
         result.join(" ")
     }
+
+    /// Нормализовать падеж типа улицы: «проспекту» → «проспект», «улицы» → «улица».
+    ///
+    /// В OSM встречаются названия, где сам тип улицы записан в косвенном падеже
+    /// (дательном, родительном). Функция приводит тип улицы к именительному падежу
+    /// во всех словах текста.
+    pub fn normalize_street_types_case(text: &str) -> String {
+        let words: Vec<&str> = text.split_whitespace().collect();
+        let mut result = Vec::with_capacity(words.len());
+
+        for &word in &words {
+            if !contains_cyrillic(word) {
+                result.push(word.to_string());
+                continue;
+            }
+            let lower = word.to_lowercase();
+            if let Some(canonical) = resolve_oblique_street_type(&lower) {
+                result.push(restore_case(canonical, word));
+            } else {
+                result.push(word.to_string());
+            }
+        }
+
+        result.join(" ")
+    }
 }
 
 /// Проверить, заканчивается ли слово на указанное окончание (по символам).
@@ -315,6 +366,69 @@ fn format_adj(original: &str, lower_stem: &str, new_ending: &str) -> String {
     let stem_len = lower_stem.chars().count();
     let orig_stem: String = orig_chars[..stem_len].iter().collect();
     format!("{}{}", orig_stem, new_ending)
+}
+
+/// Таблица косвенных падежей типов улиц → именительный падеж.
+/// «проспекту» → «проспект», «улицы» → «улица» и т.д.
+const OBLIQUE_STREET_TYPE_MAP: &[(&str, &str)] = &[
+    // Мужской род — родительный (-а) и дательный (-у)
+    ("проспекта", "проспект"),
+    ("проспекту", "проспект"),
+    ("бульвара", "бульвар"),
+    ("бульвару", "бульвар"),
+    ("проезда", "проезд"),
+    ("проезду", "проезд"),
+    ("тупика", "тупик"),
+    ("тупику", "тупик"),
+    ("вала", "вал"),
+    ("валу", "вал"),
+    ("спуска", "спуск"),
+    ("спуску", "спуск"),
+    ("подъезда", "подъезд"),
+    ("подъезду", "подъезд"),
+    ("тракта", "тракт"),
+    ("тракту", "тракт"),
+    ("моста", "мост"),
+    ("мосту", "мост"),
+    ("канала", "канал"),
+    ("каналу", "канал"),
+    ("съезда", "съезд"),
+    ("съезду", "съезд"),
+    // переулок — беглая гласная
+    ("переулка", "переулок"),
+    ("переулку", "переулок"),
+    // Женский род — родительный/дательный
+    ("улицы", "улица"),
+    ("улице", "улица"),
+    ("аллеи", "аллея"),
+    ("линии", "линия"),
+    ("дороги", "дорога"),
+    ("дороге", "дорога"),
+    ("набережной", "набережная"),
+    ("площади", "площадь"),
+];
+
+/// Определить род существительного по окончанию (упрощённая эвристика).
+///
+/// -а/-я → женский, -о/-е → средний, согласная → мужской.
+fn detect_noun_gender(lower: &str) -> Option<char> {
+    let chars: Vec<char> = lower.chars().collect();
+    match chars.last()? {
+        'а' | 'я' => Some('f'),
+        'о' | 'е' => Some('n'),
+        _ => Some('m'), // согласная, й, ь → мужской
+    }
+}
+
+/// Разрешить косвенный падеж типа улицы в именительный.
+/// Возвращает каноническую форму, если слово — известный тип улицы в косвенном падеже.
+fn resolve_oblique_street_type(lower: &str) -> Option<&'static str> {
+    for &(oblique, canonical) in OBLIQUE_STREET_TYPE_MAP {
+        if lower == oblique {
+            return Some(canonical);
+        }
+    }
+    None
 }
 
 /// Скачать словарь по URL и сохранить локально.
@@ -367,6 +481,45 @@ fn contains_cyrillic(s: &str) -> bool {
             '\u{0500}'..='\u{052F}'    // Кириллица (расширенная)
         )
     })
+}
+
+/// Слово защищено от коррекции SymSpell.
+///
+/// Защищены:
+/// - Типы улиц (улица, проспект, переулок, ...) — валидные термины
+/// - Топонимы на -ово/-ево/-ино (Исаково, Бородино, ...)
+/// - Названия городов с характерными окончаниями (-ск, -цк, -град, -бург, -поль)
+fn is_protected_word(lower: &str) -> bool {
+    // Все списки типов улиц
+    if STREET_TYPE_PREFIXES.contains(&lower) {
+        return true;
+    }
+    if FEMININE_STREET_TYPES.contains(&lower) {
+        return true;
+    }
+    if MASCULINE_STREET_TYPES.contains(&lower) {
+        return true;
+    }
+    if NEUTER_STREET_TYPES.contains(&lower) {
+        return true;
+    }
+
+    // Топонимы на -ово/-ево/-ино
+    if lower.ends_with("ово") || lower.ends_with("ево") || lower.ends_with("ино") {
+        return true;
+    }
+
+    // Названия городов: -ск, -цк (Гурьевск, Балтийск, Донецк, ...)
+    // Требуем ≥3 символов перед окончанием, чтобы исключить «диск», «поиск»
+    if (lower.ends_with("ск") || lower.ends_with("цк")) && lower.len() >= 5 {
+        return true;
+    }
+    // -град, -бург, -поль (Калининград, Оренбург, Севастополь, ...)
+    if lower.ends_with("град") || lower.ends_with("бург") || lower.ends_with("поль") {
+        return true;
+    }
+
+    false
 }
 
 /// Восстановить регистр первой буквы: если оригинал начинался с заглавной,
@@ -454,6 +607,72 @@ mod tests {
         assert_eq!(title_case_first("а"), "А");
     }
 
+    #[test]
+    fn test_normalize_street_types_case_basic() {
+        // Masculine dative → nominative
+        assert_eq!(
+            Corrector::normalize_street_types_case("Московский проспекту"),
+            "Московский проспект"
+        );
+        // Masculine genitive
+        assert_eq!(
+            Corrector::normalize_street_types_case("Ленинский проспекта"),
+            "Ленинский проспект"
+        );
+        // Feminine genitive → nominative
+        assert_eq!(
+            Corrector::normalize_street_types_case("Тверская улицы"),
+            "Тверская улица"
+        );
+        // Feminine dative
+        assert_eq!(
+            Corrector::normalize_street_types_case("по улице"),
+            "по улица"
+        );
+        // переулок (fleeting vowel)
+        assert_eq!(
+            Corrector::normalize_street_types_case("Сивцев переулка"),
+            "Сивцев переулок"
+        );
+        // No change for already-correct forms
+        assert_eq!(
+            Corrector::normalize_street_types_case("Московский проспект"),
+            "Московский проспект"
+        );
+    }
+
+    #[test]
+    fn test_normalize_street_types_case_with_number() {
+        // «проспекту съезд 1» — нормализуем «проспекту», «съезд» уже в им.п.
+        assert_eq!(
+            Corrector::normalize_street_types_case("Московский проспекту съезд 1"),
+            "Московский проспект съезд 1"
+        );
+        // «съезду» → «съезд»
+        assert_eq!(
+            Corrector::normalize_street_types_case("Московский проспект съезду 3"),
+            "Московский проспект съезд 3"
+        );
+    }
+
+    #[test]
+    fn test_normalize_street_types_case_no_change() {
+        // Не-типы улиц не трогаем
+        assert_eq!(
+            Corrector::normalize_street_types_case("Большое Исаково"),
+            "Большое Исаково"
+        );
+        assert_eq!(
+            Corrector::normalize_street_types_case("Калининград"),
+            "Калининград"
+        );
+        // Латиница не трогается
+        assert_eq!(
+            Corrector::normalize_street_types_case("Moscow street"),
+            "Moscow street"
+        );
+    }
+
     /// Интеграционный тест: создание Corrector с реальным словарём (если доступен).
     /// Пропускается, если словарь не скачан.
     #[test]
@@ -471,5 +690,83 @@ mod tests {
         eprintln!("correct('Масква') = '{result}'");
         // Не жёсткое утверждение — качество зависит от словаря
         assert!(!result.is_empty());
+    }
+
+    /// Проверка, что защищённые слова не портятся SymSpell.
+    #[test]
+    fn test_protected_words_untouched() {
+        // Ищем словарь там же, где и Corrector::new_or_download
+        let dict_path = ["ru_full.txt", "data/ru_full.txt"]
+            .iter()
+            .map(Path::new)
+            .find(|p| p.exists())
+            .map(|p| p.to_path_buf());
+
+        let dict_path = match dict_path {
+            Some(p) => p,
+            None => {
+                eprintln!("Пропуск: словарь не найден");
+                return;
+            }
+        };
+
+        let corrector = Corrector::from_file(&dict_path).unwrap();
+
+        // Тип улицы «проспект» не должен превращаться в «проспекту»
+        let r = corrector.correct("Московский проспект");
+        eprintln!("correct('Московский проспект') = '{r}'");
+        assert!(
+            r.contains("проспект"),
+            "«проспект» испорчен: '{r}'"
+        );
+        assert!(
+            !r.contains("проспекту"),
+            "«проспект» перекорректирован в «проспекту»: '{r}'"
+        );
+
+        // Топоним «Исаково» не должен превращаться в «Исакова»
+        let r = corrector.correct("Большое Исаково");
+        eprintln!("correct('Большое Исаково') = '{r}'");
+        assert!(
+            r.contains("Исаково"),
+            "«Исаково» испорчен: '{r}'"
+        );
+        assert!(
+            !r.contains("Исакова"),
+            "«Исаково» перекорректирован в «Исакова»: '{r}'"
+        );
+
+        // Полный проблемный адрес
+        let r = corrector.correct("Московский проспект съезд 1");
+        eprintln!("correct('Московский проспект съезд 1') = '{r}'");
+        assert!(
+            r.contains("проспект"),
+            "«проспект» испорчен в полном адресе: '{r}'"
+        );
+    }
+
+    /// Проверка, что названия городов не искажаются SymSpell.
+    #[test]
+    fn test_city_names_untouched() {
+        let dict_path = ["ru_full.txt", "data/ru_full.txt"]
+            .iter()
+            .map(Path::new)
+            .find(|p| p.exists())
+            .map(|p| p.to_path_buf());
+
+        let dict_path = match dict_path {
+            Some(p) => p,
+            None => { eprintln!("Пропуск: словарь не найден"); return; }
+        };
+
+        let corrector = Corrector::from_file(&dict_path).unwrap();
+
+        for city in &["Гурьевск", "Балтийск", "Славск", "Гвардейск", "Светлогорск",
+                       "Зеленоградск", "Пионерский", "Советск", "Неман", "Гусев",
+                       "Черняховск", "Краснознаменск", "Нестеров"] {
+            let r = corrector.correct(city);
+            eprintln!("correct('{city}') = '{r}'");
+            assert_eq!(r, *city, "Название города '{city}' искажено в '{r}'");
+        }
     }
 }

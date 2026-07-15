@@ -146,10 +146,16 @@ fn cmd_build(
     if let Some(c) = corrector {
         parser = parser.with_corrector(c);
     }
-    let objects = parser.parse_file(&input_path)?;
+    let mut objects = parser.parse_file(&input_path)?;
     info!("Извлечено {} объектов", objects.len());
 
-    // 4. Дедупликация
+    // 4. Привязка адресов без города к ближайшему городу
+    parser::infer_missing_cities(&mut objects);
+
+    // 4b. Склеивание городов-опечаток с каноническими названиями
+    parser::merge_typo_cities(&mut objects);
+
+    // 5. Дедупликация
     let objects = dedup::deduplicate(objects);
     let addr_count = objects.iter().filter(|o| o.as_address().is_some()).count();
     let named_count = objects.iter().filter(|o| o.as_named().is_some()).count();
@@ -160,7 +166,7 @@ fn cmd_build(
         count, addr_count, named_count
     );
 
-    // 5. Запись в выбранном формате
+    // 6. Запись в выбранном формате
     let file_size = if format == "compact" {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -195,7 +201,7 @@ fn cmd_build(
         file_size as f64 / (1024.0 * 1024.0)
     );
 
-    // 6. Сжатие и метаданные (для обоих форматов)
+    // 7. Сжатие и метаданные (для обоих форматов)
     let output_dir = output_path.parent().unwrap_or(std::path::Path::new("."));
     let mut metadata = finalizer::Metadata {
         version: env!("CARGO_PKG_VERSION").to_string(),

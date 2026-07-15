@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 description = "ETL-пайплайн для подготовки офлайн-базы геокодирования из OpenStreetMap"
 
+[[bin]]
+name = "inspect_pbf"
+path = "src/bin/inspect_pbf.rs"
+
 [dependencies]
 # PBF parsing
 osmpbf = "0.3"

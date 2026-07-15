@@ -492,6 +492,63 @@ mod tests {
     }
 
     #[test]
+    fn test_compact_roundtrip_problematic_address() {
+        // Проверка, что проблемные строки не искажаются в компактном формате.
+        // Адрес как есть (уже после коррекции) должен сохраниться без изменений.
+        let objects = vec![GeoObject::Address(Address {
+            country: None,
+            city: Some("Большое Исаково".into()),
+            street: Some("Московский проспект съезд 1".into()),
+            housenumber: Some("1".into()),
+            postcode: None,
+            lat: 54.7,
+            lon: 20.5,
+        })];
+
+        let path = std::path::PathBuf::from("/tmp/test_compact_roundtrip.bin");
+        let mut writer = CompactWriter::new();
+        writer.build(&objects, &path, "RU-TEST", 0).unwrap();
+
+        // Читаем файл обратно и проверяем строки в пуле
+        let data = std::fs::read(&path).unwrap();
+
+        // Пропускаем header (88 байт)
+        let sp_off = 88;
+        let sp_count = u32::from_le_bytes(data[sp_off..sp_off+4].try_into().unwrap()) as usize;
+
+        let mut pool: Vec<String> = Vec::new();
+        let mut pos = sp_off + 4;
+        for _ in 0..sp_count {
+            let slen = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize;
+            pos += 2;
+            let s = String::from_utf8(data[pos..pos+slen].to_vec()).unwrap();
+            pool.push(s);
+            pos += slen;
+        }
+
+        // Ищем строки в пуле
+        eprintln!("String pool: {pool:?}");
+        assert!(
+            pool.contains(&"Большое Исаково".to_string()),
+            "Пул не содержит «Большое Исаково»: {pool:?}"
+        );
+        assert!(
+            pool.contains(&"Московский проспект съезд 1".to_string()),
+            "Пул не содержит «Московский проспект съезд 1»: {pool:?}"
+        );
+        assert!(
+            !pool.iter().any(|s| s.contains("Исакова")),
+            "Пул содержит искажённое «Исакова»: {pool:?}"
+        );
+        assert!(
+            !pool.iter().any(|s| s.contains("проспекту")),
+            "Пул содержит искажённое «проспекту»: {pool:?}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn test_compact_addr_index_sorted() {
         let objects = vec![
             GeoObject::Address(Address {
