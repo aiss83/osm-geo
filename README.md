@@ -57,16 +57,18 @@ cargo build --release
 
 ### Сборка с нейросетевым нормализатором (ONNX)
 
-Требует системные библиотеки. Нейросеть (mt5-small, 300M параметров) повышает точность до **98.1%**,
+Нейросеть (mt5-small, 300M параметров) повышает точность до **98.1%**,
 исправляя согласование прилагательных: `Калининградской улица` → `Калининградская улица`.
 
 **Установка зависимостей:**
 
+Только ONNX Runtime требует системную библиотеку. SentencePiece — чистый Rust, без внешних зависимостей.
+
 | Платформа | Команда |
 |---|---|
-| macOS (Homebrew) | `brew install onnxruntime sentencepiece` |
-| Ubuntu/Debian | `apt install libonnxruntime-dev libsentencepiece-dev` |
-| Arch Linux | `pacman -S onnxruntime sentencepiece` |
+| macOS (Homebrew) | `brew install onnxruntime` |
+| Ubuntu/Debian | `apt install libonnxruntime-dev` |
+| Arch Linux | `pacman -S onnxruntime` |
 
 **Сборка:**
 
@@ -101,7 +103,7 @@ models/
 |---|---|---|
 | *(без флагов)* | Rule-based нормализатор (по умолчанию) | Нет |
 | `neural-normalizer` | ONNX Runtime для нейросети | `libonnxruntime` |
-| `neural-tokenizer` | SentencePiece токенизация | `libsentencepiece` |
+| `neural-tokenizer` | SentencePiece токенизация (pure Rust) | Нет |
 
 Пример: `cargo build --release --features neural-normalizer,neural-tokenizer`
 
