@@ -1,6 +1,6 @@
 [package]
 name = "osm-geo"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "ETL-пайплайн для подготовки офлайн-базы геокодирования из OpenStreetMap"
 

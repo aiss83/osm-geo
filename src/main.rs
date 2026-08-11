@@ -26,6 +26,7 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "osm-geo")]
+#[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(about = "ETL-пайплайн для подготовки офлайн-базы геокодирования из OSM")]
 struct Cli {
     #[command(subcommand)]
