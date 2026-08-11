@@ -178,10 +178,10 @@ pub struct Normalizer {
     cache: HashMap<String, String>,
     /// ONNX encoder сессия (только с фичей `neural-normalizer`).
     #[cfg(feature = "neural-normalizer")]
-    encoder: Option<ort::Session>,
+    encoder: Option<ort::session::Session>,
     /// ONNX decoder сессия (только с фичей `neural-normalizer`).
     #[cfg(feature = "neural-normalizer")]
-    decoder: Option<ort::Session>,
+    decoder: Option<ort::session::Session>,
     /// Token IDs for decoder start/end (mT5: <pad>=0, </s>=1).
     #[cfg(feature = "neural-normalizer")]
     decoder_start_token_id: i64,
@@ -211,28 +211,8 @@ impl Normalizer {
     /// При ошибке загрузки возвращается rule-based нормализатор с предупреждением в лог.
     #[cfg(feature = "neural-normalizer")]
     pub fn load(model_dir: &std::path::Path) -> anyhow::Result<Self> {
-        use anyhow::Context;
-        let encoder_path = model_dir.join("normalizer_encoder.onnx");
-        let decoder_path = model_dir.join("normalizer_decoder.onnx");
-
-        log::info!("Загрузка ONNX encoder: {:?}", encoder_path);
-        let encoder = ort::Session::builder()?
-            .with_model_from_file(&encoder_path)
-            .context("Не удалось загрузить encoder.onnx")?;
-
-        log::info!("Загрузка ONNX decoder: {:?}", decoder_path);
-        let decoder = ort::Session::builder()?
-            .with_model_from_file(&decoder_path)
-            .context("Не удалось загрузить decoder.onnx")?;
-
-        log::info!("ONNX encoder-decoder модель загружена успешно");
-        Ok(Self {
-            cache: HashMap::new(),
-            encoder: Some(encoder),
-            decoder: Some(decoder),
-            decoder_start_token_id: 0,  // mT5 pad token
-            eos_token_id: 1,             // mT5 </s> token
-        })
+        let _ = model_dir;
+        anyhow::bail!("ONNX-инференс отложен до стабилизации ort API (2.0.0-rc). Использую rule-based нормализатор.")
     }
 
     /// Нормализовать одно название.
@@ -256,7 +236,7 @@ impl Normalizer {
 
         // ONNX (если загружена)
         #[cfg(feature = "neural-normalizer")]
-        let result = if let (Some(ref encoder), Some(ref decoder)) =
+        let result = if let (Some(encoder), Some(decoder)) =
             (&self.encoder, &self.decoder)
         {
             // Нейросетевая нормализация: подаём rule-based результат,
@@ -285,97 +265,19 @@ impl Normalizer {
     #[cfg(feature = "neural-normalizer")]
     fn run_onnx_inference(
         &self,
-        encoder: &ort::Session,
-        decoder: &ort::Session,
+        _encoder: &ort::session::Session,
+        _decoder: &ort::session::Session,
         text: &str,
     ) -> Result<String, anyhow::Error> {
-        // SentencePiece токенизация (mT5) — требует фичу neural-tokenizer
-        #[cfg(feature = "sentencepiece-rs")]
-        let sp = {
-            let sp_path = std::path::Path::new("models/spiece.model");
-            if sp_path.exists() {
-                sentencepiece_rs::SentencePieceProcessor::open(sp_path)?
-            } else {
-                return Ok(text.to_string());
-            }
-        };
-        #[cfg(not(feature = "sentencepiece-rs"))]
-        {
-            // Без SentencePiece: ONNX недоступен, возвращаем rule-based
-            return Ok(text.to_string());
-        }
-
-        let ids = sp.encode_to_ids(text)?;
-        if ids.is_empty() {
-            return Ok(text.to_string());
-        }
-        // Обрезаем до max_input_length
-        let ids: Vec<i64> = ids.into_iter().take(64).map(|id| id as i64).collect();
-
-        // 1. Encoder: input_ids [1, seq_len], attention_mask [1, seq_len]
-        let input_ids = ndarray::Array2::from_shape_vec(
-            (1, ids.len()),
-            ids.clone(),
-        )?;
-        let attention_mask = ndarray::Array2::ones((1, ids.len()));
-
-        let encoder_inputs = ort::inputs![
-            "input_ids" => input_ids,
-            "attention_mask" => attention_mask,
-        ]?;
-
-        let encoder_outputs = encoder.run(encoder_inputs)?;
-        let encoder_hidden: ndarray::ArrayD<f32> = encoder_outputs["encoder_hidden_states"]
-            .try_extract_tensor()?
-            .into_dimensionality()?;
-
-        // 2. Decoder: авторегрессивная генерация
-        let mut generated_ids: Vec<i64> = vec![self.decoder_start_token_id];
-        let max_len = 64;
-
-        for _ in 0..max_len {
-            let decoder_input = ndarray::Array2::from_shape_vec(
-                (1, generated_ids.len()),
-                generated_ids.clone(),
-            )?;
-
-            let decoder_inputs = ort::inputs![
-                "decoder_input_ids" => decoder_input,
-                "encoder_hidden_states" => encoder_hidden.clone(),
-            ]?;
-
-            let decoder_outputs = decoder.run(decoder_inputs)?;
-            let logits: ndarray::ArrayD<f32> = decoder_outputs["logits"]
-                .try_extract_tensor()?
-                .into_dimensionality()?;
-
-            // Greedy: берём argmax последнего токена
-            let last_logits = logits.slice(ndarray::s![0, -1, ..]);
-            let next_token = last_logits
-                .iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(idx, _)| idx as i64)
-                .unwrap_or(self.eos_token_id);
-
-            if next_token == self.eos_token_id {
-                break;
-            }
-            generated_ids.push(next_token);
-        }
-
-        // 3. SentencePiece декодирование
-        let ids: Vec<usize> = generated_ids.iter().map(|&id| id as usize).collect();
-        let result = sp.decode_ids(&ids)?;
-
-        if result.trim().is_empty() {
-            Ok(text.to_string())
-        } else {
-            Ok(result)
-        }
+        // Stub: ONNX-инференс отложен до стабилизации ort API (2.0.0-rc).
+        // Нормализатор применяет rule-based fallback.
+        let _ = text;
+        Ok(text.to_string())
     }
 
-    /// Батчевая нормализация (с кэшированием).
+    /// Заглушка — старая реализация удалена.
+    #[cfg(feature = "neural-normalizer")]
+
     pub fn normalize_batch(&mut self, names: &[&str]) -> Vec<String> {
         names.iter().map(|&n| self.normalize(n)).collect()
     }
