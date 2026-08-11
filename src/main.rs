@@ -12,6 +12,7 @@ mod downloader;
 mod finalizer;
 mod indexer;
 mod model;
+mod normalizer;
 mod parser;
 mod translit;
 
@@ -154,6 +155,28 @@ fn cmd_build(
 
     // 4b. Склеивание городов-опечаток с каноническими названиями
     parser::merge_typo_cities(&mut objects);
+
+    // 4c. Нормализация названий (нейросеть при наличии ONNX, всегда rule-based)
+    {
+        #[cfg(feature = "neural-normalizer")]
+        let mut normalizer = {
+            let model_dir = std::path::PathBuf::from("models");
+            match normalizer::Normalizer::load(&model_dir) {
+                Ok(n) => {
+                    info!("Нейросетевой нормализатор активирован");
+                    n
+                }
+                Err(e) => {
+                    log::warn!("ONNX-модель не загружена: {} (использую rule-based)", e);
+                    normalizer::Normalizer::new()
+                }
+            }
+        };
+        #[cfg(not(feature = "neural-normalizer"))]
+        let mut normalizer = normalizer::Normalizer::new();
+
+        objects = normalizer.normalize_objects(objects);
+    }
 
     // 5. Дедупликация
     let objects = dedup::deduplicate(objects);

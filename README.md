@@ -36,6 +36,10 @@ ETL-пайплайн для подготовки офлайн-базы геок�
 
 ## Установка
 
+### Базовая сборка (rule-based нормализатор)
+
+Без внешних зависимостей — работает на всех платформах «из коробки»:
+
 ```bash
 git clone https://github.com/aiss83/osm-geo.git
 cd osm-geo
@@ -43,6 +47,55 @@ cargo build --release
 ```
 
 Бинарный файл: `target/release/osm-geo`
+
+Нормализатор названий включён по умолчанию и обрабатывает:
+- Раскрытие сокращений: `ул` → `улица`, `пр-т` → `проспект`, `пл` → `площадь` и ещё 15+
+- Нормализацию падежей: `улицы` → `улица`, `проспекту` → `проспект`
+- Комбинации: `пр-ту Мира` → `проспект Мира`
+
+Точность rule-based нормализатора: **90.6%** (на эталонном наборе из 53 тестов).
+
+### Сборка с нейросетевым нормализатором (ONNX)
+
+Требует системные библиотеки. Нейросеть (mt5-small, 300M параметров) повышает точность до **98.1%**,
+исправляя согласование прилагательных: `Калининградской улица` → `Калининградская улица`.
+
+**Установка зависимостей:**
+
+| Платформа | Команда |
+|---|---|
+| macOS (Homebrew) | `brew install onnxruntime sentencepiece` |
+| Ubuntu/Debian | `apt install libonnxruntime-dev libsentencepiece-dev` |
+| Arch Linux | `pacman -S onnxruntime sentencepiece` |
+
+**Сборка:**
+
+```bash
+cargo build --release --features neural-normalizer,neural-tokenizer
+```
+
+**Размещение модели:**
+
+Скачайте или сгенерируйте ONNX-модель (инструкция в [`models/README.md`](models/README.md)) и поместите файлы в `models/`:
+
+```
+models/
+├── normalizer_encoder.onnx   # 141 MB (INT8)
+├── normalizer_decoder.onnx   # 269 MB (INT8)
+└── spiece.model              # 4.1 MB (SentencePiece токенизатор)
+```
+
+При отсутствии модели нормализатор автоматически использует rule-based режим.
+
+### Feature-флаги
+
+| Флаг | Назначение | Зависимости |
+|---|---|---|
+| *(без флагов)* | Rule-based нормализатор (по умолчанию) | Нет |
+| `neural-normalizer` | ONNX Runtime для нейросети | `libonnxruntime` |
+| `neural-tokenizer` | SentencePiece токенизация | `libsentencepiece` |
+
+Пример: `cargo build --release --features neural-normalizer,neural-tokenizer`
 
 ## Использование
 

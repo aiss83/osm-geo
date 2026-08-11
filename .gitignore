@@ -9,3 +9,15 @@
 *.osm.pbf.gz
 *.osm.pbf.zst
 .DS_Store
+# ONNX модели и артефакты ML
+*.onnx
+*.onnx.fp32
+models/spiece.model
+models/output/
+models/output_full/
+models/data/
+.hf_cache/
+
+# Python
+.venv/
+__pycache__/

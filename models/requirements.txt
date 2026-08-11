@@ -1,0 +1,19 @@
+# ML-пайплайн нормализатора названий
+# Установка: pip install -r requirements.txt
+
+# Ядро
+torch>=2.0
+transformers>=4.46,<5.0
+datasets>=2.14
+accelerate>=0.25
+evaluate>=0.4
+
+# ONNX
+onnx>=1.15
+onnxruntime>=1.17
+optimum[onnxruntime]>=1.18
+
+# Утилиты
+numpy>=1.24
+sentencepiece>=0.1.99  # для mT5/NLLB токенизаторов
+protobuf>=3.20

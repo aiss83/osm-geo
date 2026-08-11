@@ -203,6 +203,7 @@ impl Corrector {
     /// - Если первый токен — слово-тип улицы (напр. «улица», «проспект»),
     ///   он приводится к нижнему регистру, а остальные слова — каждое с большой буквы.
     /// - Иначе — регистр предложения: первое слово с большой, остальные как есть.
+   #[deprecated(note = "Заменено на normalizer::normalize_rule_based. Будет удалено после верификации.")]
     pub fn normalize_case(text: &str) -> String {
         if text.is_empty() {
             return text.to_string();
@@ -254,6 +255,7 @@ impl Corrector {
     /// - Женский (-а/-я):      -ой→-ая, -ей→-яя
     /// - Мужской (согласная):  -ой→-ый/-ий, -ей→-ий
     /// - Средний (-о/-е):      -ой→-ое, -ей→-ее
+    #[deprecated(note = "Заменено на normalizer::normalize_rule_based. Будет удалено после верификации нейросети.")]
     pub fn fix_adjective_agreement(text: &str) -> String {
         let words: Vec<&str> = text.split_whitespace().collect();
         if words.len() < 2 {
@@ -326,6 +328,7 @@ impl Corrector {
     /// В OSM встречаются названия, где сам тип улицы записан в косвенном падеже
     /// (дательном, родительном). Функция приводит тип улицы к именительному падежу
     /// во всех словах текста.
+    #[deprecated(note = "Заменено на normalizer::normalize_oblique_street_types. Будет удалено после верификации.")]
     pub fn normalize_street_types_case(text: &str) -> String {
         let words: Vec<&str> = text.split_whitespace().collect();
         let mut result = Vec::with_capacity(words.len());
