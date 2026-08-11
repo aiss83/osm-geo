@@ -76,7 +76,15 @@ cargo build --release --features neural-normalizer,neural-tokenizer
 
 **Размещение модели:**
 
-Скачайте или сгенерируйте ONNX-модель (инструкция в [`models/README.md`](models/README.md)) и поместите файлы в `models/`:
+Скачайте готовую модель из GitHub Releases:
+
+```bash
+bash models/download.sh
+```
+
+Или сгенерируйте самостоятельно — инструкция в [`models/README.md`](models/README.md).
+
+Файлы модели в `models/`:
 
 ```
 models/
