@@ -11,7 +11,7 @@ path = "src/bin/inspect_pbf.rs"
 [features]
 default = []
 neural-normalizer = ["ort", "ndarray"]
-neural-tokenizer = ["sentencepiece"]
+neural-tokenizer = ["sentencepiece-rs"]
 
 [dependencies]
 # PBF parsing
@@ -47,7 +47,7 @@ env_logger = "0.11"
 # ONNX Runtime (нейросетевая нормализация, за feature-флагом)
 # NOTE: ort 2.x ещё в pre-release; обновить на "2" после стабилизации.
 ort = { version = "2.0.0-rc.13", optional = true, features = ["load-dynamic"] }
-# SentencePiece токенизатор (для mT5 модели)
-sentencepiece = { version = "0.1", optional = true }
+# SentencePiece токенизатор (pure Rust, без C++ зависимостей)
+sentencepiece-rs = { version = "0.2", optional = true }
 # ndarray для тензорных операций в ONNX инференсе
 ndarray = { version = "0.15", optional = true }

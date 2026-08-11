@@ -290,22 +290,22 @@ impl Normalizer {
         text: &str,
     ) -> Result<String, anyhow::Error> {
         // SentencePiece токенизация (mT5) — требует фичу neural-tokenizer
-        #[cfg(feature = "sentencepiece")]
+        #[cfg(feature = "sentencepiece-rs")]
         let sp = {
             let sp_path = std::path::Path::new("models/spiece.model");
             if sp_path.exists() {
-                sentencepiece::SentencePieceProcessor::open(sp_path)?
+                sentencepiece_rs::SentencePieceProcessor::open(sp_path)?
             } else {
                 return Ok(text.to_string());
             }
         };
-        #[cfg(not(feature = "sentencepiece"))]
+        #[cfg(not(feature = "sentencepiece-rs"))]
         {
             // Без SentencePiece: ONNX недоступен, возвращаем rule-based
             return Ok(text.to_string());
         }
 
-        let ids = sp.encode(text)?;
+        let ids = sp.encode_to_ids(text)?;
         if ids.is_empty() {
             return Ok(text.to_string());
         }
@@ -365,7 +365,8 @@ impl Normalizer {
         }
 
         // 3. SentencePiece декодирование
-        let result = sp.decode(&generated_ids)?;
+        let ids: Vec<usize> = generated_ids.iter().map(|&id| id as usize).collect();
+        let result = sp.decode_ids(&ids)?;
 
         if result.trim().is_empty() {
             Ok(text.to_string())
