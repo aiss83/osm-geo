@@ -10,7 +10,7 @@ path = "src/bin/inspect_pbf.rs"
 
 [features]
 default = []
-neural-normalizer = ["ort", "ndarray"]
+neural-normalizer = ["tract-onnx", "ndarray"]
 neural-tokenizer = ["sentencepiece-rs"]
 
 [dependencies]
@@ -44,9 +44,8 @@ indicatif = "0.17"
 # Logging
 log = "0.4"
 env_logger = "0.11"
-# ONNX Runtime (нейросетевая нормализация, за feature-флагом)
-# NOTE: ort 2.x ещё в pre-release; обновить на "2" после стабилизации.
-ort = { version = "2.0.0-rc.13", optional = true, features = ["load-dynamic"] }
+# ONNX Runtime на чистом Rust (tract, без системных библиотек)
+tract-onnx = { version = "0.23", optional = true }
 # SentencePiece токенизатор (pure Rust, без C++ зависимостей)
 sentencepiece-rs = { version = "0.2", optional = true }
 # ndarray для тензорных операций в ONNX инференсе
