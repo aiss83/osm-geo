@@ -25,7 +25,8 @@ osm-geo поддерживает два формата выходных данн
 
    Опционально — нейросетевой нормализатор (mt5-small, ONNX), повышающий точность до **98.1%**:
    - Исправляет согласование прилагательных: `Калининградской улица` → `Калининградская улица`
-   - Требует `libonnxruntime` и ONNX-модели в `models/` (см. [README](README.md#сборка-с-нейросетевым-нормализатором-onnx))
+    - Использует `tract-onnx` (чистый Rust, без системных библиотек) и SentencePiece токенизатор
+    - Требует ONNX-модели в `models/` (см. [README](README.md#сборка-с-нейросетевым-нормализатором-onnx))
 
 2. **Коррекция опечаток** (SymSpell) — по частотному словарю русского языка (`ru_full.txt`, ~1.4M слов, 28 МБ). Словарь включён в репозиторий; при его отсутствии скачивается автоматически. Исправляет типичные опечатки: «Масква» → «Москва».
     
@@ -34,17 +35,19 @@ osm-geo поддерживает два формата выходных данн
     - Названия городов с характерными окончаниями (-ск, -цк, -град, -бург, -поль)
     - Топонимы на -ово/-ево/-ино (Исаково, Бородино, ...)
 
-### Постобработка адресов
+### Постобработка адресов и POI
 
-После парсинга выполняются два дополнительных шага для повышения качества адресных данных:
+После парсинга выполняются дополнительные шаги для повышения качества данных:
 
-5. **Привязка к городам** — адреса без поля `addr:city` автоматически привязываются к ближайшему городу по координатам (Haversine distance). Строится карта центроидов городов по адресам с известным городом, затем каждый бесхозный адрес получает ближайший город.
+5. **Привязка к городам** — адреса и POI без поля `addr:city` автоматически привязываются к ближайшему городу по координатам (Haversine distance). Строится карта центроидов городов по объектам с известным городом, затем каждый бесхозный объект получает ближайший город.
 
-6. **Склеивание опечаток в городах** — названия городов, отличающиеся от более частотных на 1–2 символа (Левенштейн), объединяются: «Калининнград» → «Калининград». Порог: опечаточный город должен иметь минимум вдвое меньше адресов, чем канонический.
+6. **Склеивание опечаток в городах** — названия городов, отличающиеся от более частотных на 1–2 символа (Левенштейн), объединяются: «Калининнград» → «Калининград». Порог: опечаточный город должен иметь минимум вдвое меньше объектов, чем канонический.
+
+7. **Привязка к стране** — для объектов без страны код страны определяется по городу (через карту «город→страна», построенную по объектам с известной страной). Если город неизвестен, страна извлекается из кода региона (первые 2 символа параметра `-r`, например `RU-CFD` → `RU`).
 
 ### Фильтрация POI
 
-В базу попадают именованные объекты трёх категорий: `historic` (памятники, мемориалы), `shop` (магазины, ТЦ), `tourism` (зоопарки, музеи, отели). Остановки транспорта, дороги, офисы, административные границы и природные объекты — не включаются.
+В базу попадают именованные объекты двух категорий: `historic` (памятники, мемориалы), `tourism` (зоопарки, музеи, отели). Остановки транспорта, дороги, офисы, административные границы и природные объекты — не включаются.
 
 Коррекция уменьшает задвоение записей из-за опечаток, разного регистра и падежных несогласованностей в исходных данных OSM.
 
@@ -94,7 +97,6 @@ CREATE TABLE objects (
     postcode     TEXT,
     -- NamedObject fields (type = 1)
     name         TEXT,
-    translit     TEXT,
     category     TEXT
 );
 ```
@@ -104,10 +106,10 @@ CREATE TABLE objects (
 | `id` | INTEGER | Автоинкрементный первичный ключ, используется как `rowid` в FTS |
 | `type` | INTEGER | `0` — адрес, `1` — POI |
 | `lat`, `lon` | REAL | Координаты WGS 84 |
-| `country`…`postcode` | TEXT | Адресные поля (NULL для type=1) |
+| `country`, `city` | TEXT | Страна и город — заполняются как для Address, так и для NamedObject |
+| `street`…`postcode` | TEXT | Адресные поля (NULL для type=1) |
 | `name` | TEXT | Русское название POI (name:ru или name) |
-| `translit` | TEXT | Транслитерация названия латиницей |
-| `category` | TEXT | Категория: amenity, tourism, shop, … |
+| `category` | TEXT | Категория: historic, tourism |
 
 ### 2.2. FTS5: `fts_address` — полнотекстовый индекс адресов
 
@@ -152,7 +154,7 @@ LIMIT 20;
 
 ```sql
 CREATE VIRTUAL TABLE fts_named USING fts5(
-    name, translit, category,
+    country, city, name, category,
     tokenize = 'unicode61',
     content  = '',
     prefix   = '2 3 4'
@@ -162,8 +164,7 @@ CREATE VIRTUAL TABLE fts_named USING fts5(
 | Поле | Содержимое |
 |------|------------|
 | `name` | Основное русское название: `name:ru` или `name` (стемминг) |
-| `translit` | Транслитерация названия латиницей (стемминг). Позволяет искать латиницей: `"moskv*"` → «Москва» |
-| `category` | Категория объекта: `amenity`, `tourism`, `shop`, `highway`, `boundary`, … (без стемминга) |
+| `category` | Категория объекта: `historic`, `tourism` (без стемминга) |
 
 Правила поиска и стемминга — те же, что для `fts_address`.
 
@@ -230,7 +231,6 @@ CREATE TABLE meta (
 |---------|-----------------|
 | `amenity` | cafe, restaurant, school, hospital, bank, pharmacy, parking |
 | `tourism` | hotel, museum, attraction, viewpoint |
-| `shop` | supermarket, bakery, clothes, mall |
 | `historic` | monument, memorial, castle, ruins |
 | `leisure` | park, playground, sports_centre |
 | `office` | government, company, ngo |
@@ -491,13 +491,12 @@ type:     u8      — 0=Address, 1=Named
 lat:      f32
 lon:      f32
 Address:  city_idx:u16, street_idx:u16, housenumber_idx:u16   (6 байт, 2+2+2)
-Named:    name_idx:u16, translit_idx:u16, category:u8         (5 байт, 2+2+1)
+Named:    name_idx:u16, category:u8                           (3 байта, 2+1)
 ```
 
 **Named Index** (сортирован по строке имени):
 ```
 name_idx:      u16
-translit_idx:  u16
 category:      u8    — тег категории (1=amenity, 2=tourism, …)
 record_idx:    u32   — индекс в Record Block
 ```
@@ -552,7 +551,6 @@ typedef struct {
 /* ── Запись в Named Index (9 байт) ─────────────────────────────────── */
 typedef struct {
     uint16_t name_idx;           /* индекс строки имени в String Pool     */
-    uint16_t translit_idx;       /* индекс строки транслитерации          */
     uint8_t  category;           /* тег категории (1=Amenity, …)          */
     uint32_t record_idx;         /* индекс в Record Block                 */
 } NamedIndexEntry;
@@ -573,10 +571,11 @@ typedef struct {
 } RecordAddr;                    /* поля Address-записи (6 байт)          */
 
 typedef struct {
+    uint16_t country_idx;
+    uint16_t city_idx;
     uint16_t name_idx;
-    uint16_t translit_idx;
     uint8_t  category;
-} RecordNamed;                   /* поля Named-записи (5 байт)            */
+} RecordNamed;                   /* поля Named-записи (7 байт)            */
 
 #pragma pack(pop)
 ```
@@ -609,7 +608,6 @@ void read_records(const uint8_t *data, const Header *hdr) {
             RecordNamed named;
             memcpy(&named, ptr, sizeof(RecordNamed));
             ptr += sizeof(RecordNamed);
-            /* named.name_idx, named.translit_idx, named.category → String Pool */
         }
     }
 }
@@ -715,19 +713,19 @@ padding-байты между полями разного размера. Нап
 `category` (u8) и `record_idx` (u32). В результате `record_idx` читает
 мусор из следующей записи.
 
-**Проверка:** распечатайте `sizeof(NamedIndexEntry)`. Должно быть **9**,
+**Проверка:** распечатайте `sizeof(NamedIndexEntry)`. Должно быть **7**,
 не 12. Для `AddrIndexEntry` — **10**, не 12.
 
 ```c
 /* Правильно */
 #pragma pack(push, 1)
-typedef struct { uint16_t name_idx; uint16_t translit_idx;
+typedef struct { uint16_t name_idx;
                  uint8_t category; uint32_t record_idx; } NamedIndexEntry;
 #pragma pack(pop)
 /* sizeof(NamedIndexEntry) == 9 */
 
 /* Неправильно — без pack, sizeof == 12 */
-typedef struct { uint16_t name_idx; uint16_t translit_idx;
+typedef struct { uint16_t name_idx;
                  uint8_t category; uint32_t record_idx; } NamedIndexEntry;
 ```
 
@@ -738,7 +736,7 @@ Record Block содержит записи **разного размера**:
 | Тип | Байт |
 |-----|------|
 | Address (type=0) | 1 (type) + 4 (lat) + 4 (lon) + 2+2+2 (city,street,hn) = **15 байт** |
-| Named (type=1)   | 1 (type) + 4 (lat) + 4 (lon) + 2+2+1 (name,translit,cat) = **14 байт** |
+| Named (type=1)   | 1 (type) + 4 (lat) + 4 (lon) + 2+2+2+1 (country,city,name,cat) = **16 байт** |
 
 **`record_idx` в Named Index и Address Index — это логический номер
 записи (0-based), а НЕ байтовое смещение!** Нельзя вычислить позицию
@@ -761,7 +759,7 @@ uint32_t *build_record_offsets(const uint8_t *data, const Header *hdr,
         offsets[i] = (uint32_t)(ptr - data);  /* байтовое смещение */
         uint8_t type = *ptr;
         ptr += 1 + 8;  /* type + lat + lon */
-        ptr += (type == 0) ? 6 : 5;  /* поля адреса или POI */
+        ptr += (type == 0) ? 6 : 7;  /* поля адреса или POI */
     }
     *out_count = count;
     return offsets;
@@ -799,14 +797,14 @@ sp_off, ni_off, ai_off, rec_off = struct.unpack_from('<IIII', data, 72)
 print(f'Magic={magic} ver={ver} total={total}')
 print(f'Sizes: SP={ni_off-sp_off}, NI={ai_off-ni_off}, AI={rec_off-ai_off}')
 
-# Проверка Named Index (9 байт на запись, БЕЗ padding)
+# Проверка Named Index (7 байт на запись, БЕЗ padding)
 ni_count = struct.unpack_from('<I', data, ni_off)[0]
 pos = ni_off + 4
 for i in range(5):
-    name_idx, _, _, rec_idx = struct.unpack_from('<HHBI', data, pos)
-    print(f'  NI[{i}]: name_idx={name_idx} rec_idx={rec_idx}')
-    pos += 9
-assert ni_count * 9 + 4 == ai_off - ni_off, 'Named Index size mismatch!'
+    name_idx, cat, rec_idx = struct.unpack_from('<HBI', data, pos)
+    print(f'  NI[{i}]: name_idx={name_idx} cat={cat} rec_idx={rec_idx}')
+    pos += 7
+assert ni_count * 7 + 4 == ai_off - ni_off, 'Named Index size mismatch!'
 print('Named Index: OK')
 ```
 

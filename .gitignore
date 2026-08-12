@@ -21,3 +21,7 @@ models/data/
 # Python
 .venv/
 __pycache__/
+
+# Tools
+.codewhale/
+dist/

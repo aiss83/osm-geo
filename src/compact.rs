@@ -134,14 +134,13 @@ struct RecordEntry {
     lon: f32,
     /// Для Address: (city, street, housenumber)
     addr_indices: Option<(u16, u16, u16)>,
-    /// Для Named: (name, translit, category)
-    named_data: Option<(u16, u16, u8)>,
+    /// Для Named: (country, city, name, category)
+    named_data: Option<(u16, u16, u16, u8)>,
 }
 
 /// Запись в Named Index (сортирована по имени).
 struct NamedIndexEntry {
     name_idx: u16,
-    translit_idx: u16,
     category: u8,
     record_idx: u32,
 }
@@ -205,8 +204,9 @@ impl CompactWriter {
                     }
                 }
                 GeoObject::Named(obj) => {
+                    let country_idx = self.pool.intern(obj.country.as_deref());
+                    let city_idx = self.pool.intern(obj.city.as_deref());
                     let name_idx = self.pool.intern(Some(&obj.name));
-                    let translit_idx = self.pool.intern(obj.translit.as_deref());
                     let category = category_to_tag(obj.category.as_deref());
 
                     RecordEntry {
@@ -214,7 +214,7 @@ impl CompactWriter {
                         lat: lat as f32,
                         lon: lon as f32,
                         addr_indices: None,
-                        named_data: Some((name_idx, translit_idx, category)),
+                        named_data: Some((country_idx, city_idx, name_idx, category)),
                     }
                 }
             };
@@ -235,10 +235,9 @@ impl CompactWriter {
 
         // 3. Строим Named Index — сортирован по строке имени
         for (record_idx, rec) in self.records.iter().enumerate() {
-            if let Some((name_idx, translit_idx, category)) = rec.named_data {
+            if let Some((_country_idx, _city_idx, name_idx, category)) = rec.named_data {
                 self.named_index.push(NamedIndexEntry {
                     name_idx,
-                    translit_idx,
                     category,
                     record_idx: record_idx as u32,
                 });
@@ -286,7 +285,7 @@ impl CompactWriter {
         let string_pool_offset = std::mem::size_of::<Header>() as u32;
         let named_index_offset = string_pool_offset + self.pool.serialized_size() as u32;
         let addr_index_offset =
-            named_index_offset + (4 + self.named_index.len() * 9) as u32; // count + entries
+            named_index_offset + (4 + self.named_index.len() * 7) as u32; // count + entries (name_idx:2 + category:1 + record_idx:4 = 7)
         let records_offset =
             addr_index_offset + (4 + self.addr_index.len() * 10) as u32;
 
@@ -335,7 +334,6 @@ impl CompactWriter {
         file.write_all(&count.to_le_bytes())?;
         for entry in &self.named_index {
             file.write_all(&entry.name_idx.to_le_bytes())?;
-            file.write_all(&entry.translit_idx.to_le_bytes())?;
             file.write_all(&[entry.category])?;
             file.write_all(&entry.record_idx.to_le_bytes())?;
         }
@@ -365,9 +363,10 @@ impl CompactWriter {
                     file.write_all(&hn.to_le_bytes())?;
                 }
                 1 => {
-                    let (name, translit, category) = rec.named_data.unwrap();
+                    let (country, city, name, category) = rec.named_data.unwrap();
+                    file.write_all(&country.to_le_bytes())?;
+                    file.write_all(&city.to_le_bytes())?;
                     file.write_all(&name.to_le_bytes())?;
-                    file.write_all(&translit.to_le_bytes())?;
                     file.write_all(&[category])?;
                 }
                 _ => unreachable!(),
@@ -415,7 +414,8 @@ mod tests {
         let objects = vec![
             GeoObject::Named(NamedObject {
                 name: "Красная площадь".into(),
-                translit: Some("Krasnaya ploshchad".into()),
+                country: Some("Россия".into()),
+                city: Some("Москва".into()),
                 category: Some("tourism".into()),
                 lat: 55.7539,
                 lon: 37.6208,
@@ -431,7 +431,7 @@ mod tests {
             }),
         ];
 
-        let path = std::path::PathBuf::from("/tmp/test_compact.bin");
+        let path = std::path::PathBuf::from(std::env::temp_dir().join("test_compact.bin"));
         let mut writer = CompactWriter::new();
         writer.build(&objects, &path, "RU-TEST", 0).unwrap();
 
@@ -449,28 +449,31 @@ mod tests {
         let objects = vec![
             GeoObject::Named(NamedObject {
                 name: "В".into(),
-                translit: None,
+                country: None,
+                city: None,
                 category: None,
                 lat: 55.0,
                 lon: 37.0,
             }),
             GeoObject::Named(NamedObject {
                 name: "Б".into(),
-                translit: None,
+                country: None,
+                city: None,
                 category: None,
                 lat: 56.0,
                 lon: 38.0,
             }),
             GeoObject::Named(NamedObject {
                 name: "А".into(),
-                translit: None,
+                country: None,
+                city: None,
                 category: None,
                 lat: 57.0,
                 lon: 39.0,
             }),
         ];
 
-        let path = std::path::PathBuf::from("/tmp/test_compact_sort.bin");
+        let path = std::path::PathBuf::from(std::env::temp_dir().join("test_compact_sort.bin"));
         let mut writer = CompactWriter::new();
         writer.build(&objects, &path, "RU-TEST", 0).unwrap();
 
@@ -505,7 +508,7 @@ mod tests {
             lon: 20.5,
         })];
 
-        let path = std::path::PathBuf::from("/tmp/test_compact_roundtrip.bin");
+        let path = std::path::PathBuf::from(std::env::temp_dir().join("test_compact_roundtrip.bin"));
         let mut writer = CompactWriter::new();
         writer.build(&objects, &path, "RU-TEST", 0).unwrap();
 
@@ -571,7 +574,7 @@ mod tests {
             }),
         ];
 
-        let path = std::path::PathBuf::from("/tmp/test_compact_addr.bin");
+        let path = std::path::PathBuf::from(std::env::temp_dir().join("test_compact_addr.bin"));
         let mut writer = CompactWriter::new();
         writer.build(&objects, &path, "RU-TEST", 0).unwrap();
 

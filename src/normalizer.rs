@@ -323,10 +323,6 @@ impl Normalizer {
                     if normalized != named.name {
                         named.name = normalized;
                     }
-                    // Всегда обновлять транслитерацию, если её нет
-                    if named.translit.is_none() {
-                        named.translit = crate::translit::transliterate(&named.name);
-                    }
                     GeoObject::Named(named)
                 }
             };
@@ -636,7 +632,8 @@ mod tests {
         let mut n = Normalizer::new();
         let objects = vec![GeoObject::Named(NamedObject {
             name: "Красная площадь".into(),
-            translit: None,
+            country: None,
+            city: None,
             category: Some("tourism".into()),
             lat: 55.0,
             lon: 37.0,
@@ -644,8 +641,6 @@ mod tests {
         let result = n.normalize_objects(objects);
         if let GeoObject::Named(named) = &result[0] {
             assert_eq!(named.name, "Красная площадь");
-            // Транслитерация должна быть установлена
-            assert!(named.translit.is_some());
         } else {
             panic!("Expected Named");
         }

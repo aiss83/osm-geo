@@ -9,6 +9,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use log::info;
 
 use crate::model::GeoObject;
+use crate::utils::haversine_approx;
 
 pub fn deduplicate(objects: Vec<GeoObject>) -> Vec<GeoObject> {
     let original = objects.len();
@@ -94,16 +95,6 @@ fn normalize_key(s: Option<&str>) -> Option<String> {
     s.map(|s| s.trim().to_lowercase().replace("  ", " "))
 }
 
-fn haversine_approx(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
-    let r = 6_371_000.0;
-    let dlat = (lat2 - lat1).to_radians();
-    let dlon = (lon2 - lon1).to_radians();
-    let a = (dlat / 2.0).sin().powi(2)
-        + lat1.to_radians().cos() * lat2.to_radians().cos() * (dlon / 2.0).sin().powi(2);
-    let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
-    r * c
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,21 +138,24 @@ mod tests {
     fn test_dedup_named_same_location() {
         let obj1 = GeoObject::Named(NamedObject {
             name: "Кафе".into(),
-            translit: None,
+            country: None,
+            city: None,
             category: Some("amenity".into()),
             lat: 55.0,
             lon: 37.0,
         });
         let obj2 = GeoObject::Named(NamedObject {
             name: "Кафе".into(),
-            translit: None,
+            country: None,
+            city: None,
             category: Some("amenity".into()),
             lat: 55.0003,
             lon: 37.0003,
         });
         let obj3 = GeoObject::Named(NamedObject {
             name: "Ресторан".into(),
-            translit: None,
+            country: None,
+            city: None,
             category: Some("amenity".into()),
             lat: 55.0,
             lon: 37.0,

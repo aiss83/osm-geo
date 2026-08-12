@@ -25,13 +25,13 @@ pub struct Address {
     pub lon: f64,
 }
 
-/// Именованный объект без жёсткой адресной привязки.
-/// Только русское название + транслитерация.
+/// Именованный объект (POI) с координатной привязкой к городу и стране.
 #[derive(Debug, Clone)]
 pub struct NamedObject {
     pub name: String,
-    pub translit: Option<String>,
     pub category: Option<String>,
+    pub country: Option<String>,
+    pub city: Option<String>,
     pub lat: f64,
     pub lon: f64,
 }

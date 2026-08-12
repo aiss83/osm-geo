@@ -14,7 +14,7 @@ mod indexer;
 mod model;
 mod normalizer;
 mod parser;
-mod translit;
+mod utils;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -53,9 +53,10 @@ enum Commands {
         #[arg(short, long)]
         region: Option<String>,
 
-        /// Формат вывода: sqlite (по умолчанию) или compact
+        /// Формат вывода: sqlite (по умолчанию) или compact.
+        /// Можно указать несколько: -f sqlite -f compact
         #[arg(short, long, default_value = "sqlite")]
-        format: String,
+        format: Vec<String>,
     },
 
     /// Тестовый поиск в собранной базе
@@ -118,7 +119,7 @@ fn cmd_build(
     input: &str,
     output: Option<&PathBuf>,
     region: Option<&str>,
-    format: &str,
+    formats: &[String],
 ) -> Result<()> {
     info!("=== Сборка базы данных ===");
 
@@ -126,16 +127,25 @@ fn cmd_build(
     let input_path = resolve_input(input)?;
     info!("Входной файл: {:?}", input_path);
 
-    // 2. Определяем выходной файл
-    let default_ext = if format == "compact" { "bin" } else { "db" };
-    let output_path = match output {
-        Some(p) => p.to_path_buf(),
+    // 2. Определяем базовое имя выходного файла (без расширения)
+    let output_stem = match output {
+        Some(p) => {
+            let s = p.to_string_lossy();
+            // Отрезаем известное расширение, если указано
+            let trimmed = s
+                .strip_suffix(".db.zst")
+                .or_else(|| s.strip_suffix(".db"))
+                .or_else(|| s.strip_suffix(".bin"))
+                .unwrap_or(&s);
+            PathBuf::from(trimmed)
+        }
         None => {
             let stem = downloader::derive_output_stem(&input_path);
-            PathBuf::from(format!("{}.{}", stem, default_ext))
+            PathBuf::from(stem)
         }
     };
-    info!("Выходной файл: {:?}", output_path);
+    info!("Выходной файл (stem): {:?}", output_stem);
+    info!("Форматы: {:?}", formats);
 
     // 3. Парсинг PBF
     let corrector = corrector::Corrector::new_or_download()
@@ -156,6 +166,9 @@ fn cmd_build(
 
     // 4b. Склеивание городов-опечаток с каноническими названиями
     parser::merge_typo_cities(&mut objects);
+
+    // 4d. Простановка страны для объектов без страны
+    parser::infer_missing_countries(&mut objects, region);
 
     // 4c. Нормализация названий (нейросеть при наличии ONNX, всегда rule-based)
     {
@@ -190,64 +203,72 @@ fn cmd_build(
         count, addr_count, named_count
     );
 
-    // 6. Запись в выбранном формате
-    let file_size = if format == "compact" {
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let mut writer = compact::CompactWriter::new();
-        writer.build(&objects, &output_path, region.unwrap_or("unknown"), timestamp)?;
-        std::fs::metadata(&output_path)?.len()
-    } else {
-        let mut idx =
-            indexer::Indexer::create(&output_path)?.with_progress(count);
-        if let Some(region) = region {
-            idx.set_meta("region", region)?;
-        }
-        idx.set_meta("source", &input_path.display().to_string())?;
-        idx.set_meta("build_date", &chrono_now())?;
-        idx.set_meta("version", env!("CARGO_PKG_VERSION"))?;
-        for chunk in objects.chunks(10_000) {
-            idx.insert_batch(chunk)?;
-        }
-        idx.set_meta("object_count", &count.to_string())?;
-        idx.set_meta("addr_count", &addr_count.to_string())?;
-        idx.set_meta("named_count", &named_count.to_string())?;
-        idx.finalize()?;
-        indexer::Indexer::db_size(&output_path)?
-    };
+    // 6. Запись в каждом из запрошенных форматов
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    for fmt in formats {
+        let ext = if fmt == "compact" { "bin" } else { "db" };
+        let output_path = output_stem.with_extension(ext);
+        info!("Запись в формате {}: {:?}", fmt, output_path);
+
+        let file_size = if fmt == "compact" {
+            let mut writer = compact::CompactWriter::new();
+            writer.build(&objects, &output_path, region.unwrap_or("unknown"), timestamp)?;
+            std::fs::metadata(&output_path)?.len()
+        } else {
+            let mut idx =
+                indexer::Indexer::create(&output_path)?.with_progress(count);
+            if let Some(region) = region {
+                idx.set_meta("region", region)?;
+            }
+            idx.set_meta("source", &input_path.display().to_string())?;
+            idx.set_meta("build_date", &crate::utils::today_iso())?;
+            idx.set_meta("version", env!("CARGO_PKG_VERSION"))?;
+            for chunk in objects.chunks(10_000) {
+                idx.insert_batch(chunk)?;
+            }
+            idx.set_meta("object_count", &count.to_string())?;
+            idx.set_meta("addr_count", &addr_count.to_string())?;
+            idx.set_meta("named_count", &named_count.to_string())?;
+            idx.finalize()?;
+            indexer::Indexer::db_size(&output_path)?
+        };
+
+        info!(
+            "  Размер: {:.2} МБ",
+            file_size as f64 / (1024.0 * 1024.0)
+        );
+
+        // 7. Сжатие и метаданные
+        let output_dir = output_path.parent().unwrap_or(std::path::Path::new("."));
+        let mut metadata = finalizer::Metadata {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            region: region.unwrap_or("unknown").to_string(),
+            build_date: crate::utils::today_iso(),
+            source_pbf: input_path.display().to_string(),
+            object_count: count,
+            address_count: addr_count as u64,
+            named_count: named_count as u64,
+            db_size_bytes: file_size,
+            compressed_size_bytes: None,
+            sha256: String::new(),
+        };
+
+        let (compressed_size, sha256, _meta_json) =
+            finalizer::compress_and_export_metadata(&output_path, output_dir, &mut metadata)?;
+
+        info!("  SHA-256: {}", sha256);
+        info!(
+            "  Сжатый размер: {:.2} МБ",
+            compressed_size as f64 / (1024.0 * 1024.0)
+        );
+    }
 
     info!("=== Сборка завершена ===");
     info!("Объектов: {}", count);
-    info!(
-        "Размер файла: {:.2} МБ",
-        file_size as f64 / (1024.0 * 1024.0)
-    );
-
-    // 7. Сжатие и метаданные (для обоих форматов)
-    let output_dir = output_path.parent().unwrap_or(std::path::Path::new("."));
-    let mut metadata = finalizer::Metadata {
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        region: region.unwrap_or("unknown").to_string(),
-        build_date: chrono_now(),
-        source_pbf: input_path.display().to_string(),
-        object_count: count,
-        address_count: addr_count as u64,
-        named_count: named_count as u64,
-        db_size_bytes: file_size,
-        compressed_size_bytes: None,
-        sha256: String::new(), // будет заполнен в compress_and_export_metadata
-    };
-
-    let (compressed_size, sha256, _meta_json) =
-        finalizer::compress_and_export_metadata(&output_path, output_dir, &mut metadata)?;
-
-    info!("SHA-256: {}", sha256);
-    info!(
-        "Сжатый размер: {:.2} МБ",
-        compressed_size as f64 / (1024.0 * 1024.0)
-    );
 
     Ok(())
 }
@@ -372,7 +393,7 @@ fn print_object(conn: &Connection, id: i64) -> Result<()> {
     let mut stmt =
         conn.prepare("SELECT type, lat, lon,
             country, city, street, housenumber, postcode,
-            name, translit, category
+            name, category
             FROM objects WHERE id = ?1")?;
 
     let row = stmt.query_row([id], |row| {
@@ -387,13 +408,12 @@ fn print_object(conn: &Connection, id: i64) -> Result<()> {
             row.get::<_, Option<String>>(7)?,
             row.get::<_, Option<String>>(8)?,
             row.get::<_, Option<String>>(9)?,
-            row.get::<_, Option<String>>(10)?,
         ))
     })?;
 
     let (obj_type, lat, lon,
         country, city, street, housenumber, _postcode,
-        name, _translit, category) = row;
+        name, category) = row;
 
     match obj_type {
         0 => {
@@ -499,57 +519,4 @@ fn cmd_list(region: Option<&str>) -> Result<()> {
     println!("\nДля скачивания: osm-geo build --input {}", 
         regions.first().map(|r| r.subpath.as_str()).unwrap_or("REGION"));
     Ok(())
-}
-
-/// Текущая дата в ISO-формате.
-fn chrono_now() -> String {
-    // Простая альтернатива chrono: используем std::time
-    use std::time::SystemTime;
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = now.as_secs();
-
-    // Приблизительное преобразование unixtime → YYYY-MM-DD
-    let days = secs / 86400;
-    // 1970-01-01 + days
-    let (y, m, d) = days_to_date(days as i64);
-    format!("{:04}-{:02}-{:02}", y, m, d)
-}
-
-/// Грубое преобразование дней от 1970-01-01 в (year, month, day).
-fn days_to_date(days: i64) -> (i64, u32, u32) {
-    let mut y = 1970i64;
-    let mut remaining = days;
-
-    loop {
-        let year_days = if is_leap(y) { 366 } else { 365 };
-        if remaining < year_days {
-            break;
-        }
-        remaining -= year_days;
-        y += 1;
-    }
-
-    let month_days = if is_leap(y) {
-        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    } else {
-        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    };
-
-    let mut m = 1u32;
-    for &md in &month_days {
-        if remaining < md as i64 {
-            break;
-        }
-        remaining -= md as i64;
-        m += 1;
-    }
-
-    let d = (remaining + 1) as u32;
-    (y, m, d)
-}
-
-fn is_leap(y: i64) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
 }

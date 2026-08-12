@@ -81,14 +81,13 @@ impl Indexer {
                 postcode     TEXT,
                 -- NamedObject
                 name         TEXT,
-                translit     TEXT,
                 category     TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_objects_lat_lon ON objects(lat, lon);
 
             CREATE VIRTUAL TABLE IF NOT EXISTS fts_named USING fts5(
-                name, translit, category,
+                country, city, name, category,
                 tokenize = 'unicode61',
                 content  = '',
                 prefix   = '2 3 4'
@@ -167,30 +166,28 @@ impl Indexer {
             }
             GeoObject::Named(obj) => {
                 self.conn.prepare_cached(
-                    "INSERT INTO objects (type, lat, lon,
-                        name, translit, category)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+"INSERT INTO objects (type, lat, lon,
+                        country, city, name, category)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 )?.execute(params![
                     obj_type, lat, lon,
+                    obj.country.as_deref(),
+                    obj.city.as_deref(),
                     obj.name.as_str(),
-                    obj.translit.as_deref(),
                     obj.category.as_deref(),
                 ])?;
 
                 let id = self.conn.last_insert_rowid();
 
+                let country = self.stem_text(obj.country.as_deref().unwrap_or(""));
+                let city = self.stem_text(obj.city.as_deref().unwrap_or(""));
                 let name = self.stem_text(&obj.name);
-                let translit = obj
-                    .translit
-                    .as_deref()
-                    .map(|t| self.stem_text(t))
-                    .unwrap_or_default();
                 let category = obj.category.as_deref().unwrap_or("");
 
                 self.conn.prepare_cached(
-                    "INSERT INTO fts_named (rowid, name, translit, category)
-                     VALUES (?1, ?2, ?3, ?4)",
-                )?.execute(params![id, name, translit, category])?;
+"INSERT INTO fts_named (rowid, country, city, name, category)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                )?.execute(params![id, country, city, name, category])?;
             }
         }
 
@@ -249,7 +246,7 @@ mod tests {
     use crate::model::{Address, NamedObject};
 
     fn test_db_path() -> std::path::PathBuf {
-        std::path::PathBuf::from("/tmp/test_osm_geo.db")
+        std::env::temp_dir().join("test_osm_geo.db")
     }
 
     fn make_address() -> GeoObject {
@@ -267,7 +264,8 @@ mod tests {
     fn make_named() -> GeoObject {
         GeoObject::Named(NamedObject {
             name: "Красная площадь".into(),
-            translit: Some("Krasnaya ploshchad".into()),
+            country: Some("Россия".into()),
+            city: Some("Москва".into()),
             category: Some("tourism".into()),
             lat: 55.7539,
             lon: 37.6208,

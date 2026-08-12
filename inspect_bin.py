@@ -31,11 +31,10 @@ ni_count = struct.unpack_from('<I', data, ni_off)[0]
 print(f"\nNamed Index: {ni_count} entries")
 pos = ni_off + 4
 for i in range(min(ni_count, 5)):
-    name_idx, translit_idx, cat, rec_idx = struct.unpack_from('<HHBI', data, pos)
+    name_idx, cat, rec_idx = struct.unpack_from('<HBI', data, pos)
     name = pool[name_idx] if name_idx < len(pool) else f"OOB({name_idx})"
-    translit = pool[translit_idx] if translit_idx < len(pool) else f"OOB({translit_idx})"
-    print(f"  [{i}]: name={name_idx}='{name}', translit={translit_idx}='{translit}', cat={cat}, rec_idx={rec_idx}")
-    pos += 9
+    print(f"  [{i}]: name={name_idx}='{name}', cat={cat}, rec_idx={rec_idx}")
+    pos += 7
 
 # Read Address Index
 ai_count = struct.unpack_from('<I', data, ai_off)[0]
@@ -61,9 +60,11 @@ for i in range(min(rec_count, 10)):
         city = pool[city_idx] if city_idx < len(pool) else f"OOB({city_idx})"
         print(f"  [{i}] Addr: lat={lat:.4f} lon={lon:.4f} city={city_idx}='{city}' street={street_idx} hn={hn_idx}")
     elif obj_type == 1:
-        name_idx, translit_idx, cat = struct.unpack_from('<HHB', data, pos); pos += 5
+        country_idx, city_idx, name_idx, cat = struct.unpack_from('<HHHB', data, pos); pos += 7
+        country = pool[country_idx] if country_idx < len(pool) else f"OOB({country_idx})"
+        city = pool[city_idx] if city_idx < len(pool) else f"OOB({city_idx})"
         name = pool[name_idx] if name_idx < len(pool) else f"OOB({name_idx})"
-        print(f"  [{i}] Named: lat={lat:.4f} lon={lon:.4f} name={name_idx}='{name}' cat={cat}")
+        print(f"  [{i}] Named: lat={lat:.4f} lon={lon:.4f} country={country_idx}='{country}' city={city_idx}='{city}' name={name_idx}='{name}' cat={cat}")
     else:
         print(f"  [{i}] UNKNOWN type={obj_type}")
 

@@ -17,6 +17,7 @@ use std::path::Path;
 
 use crate::model::{Address, GeoObject, NamedObject};
 use crate::corrector::Corrector;
+use crate::utils::{levenshtein_distance, haversine_approx};
 
 /// Парсер PBF-файлов OSM.
 pub struct PbfParser {
@@ -337,15 +338,16 @@ pub fn infer_missing_cities(objects: &mut [GeoObject]) {
     // 1. Собираем центроиды городов (усреднённые координаты адресов с известным городом)
     let mut city_coords: HashMap<String, (f64, f64, u64)> = HashMap::new();
     for obj in objects.iter() {
-        if let GeoObject::Address(addr) = obj {
-            if let Some(ref city) = addr.city {
-                if !city.is_empty() {
-                    let (lat, lon) = (addr.lat, addr.lon);
-                    let entry = city_coords.entry(city.clone()).or_insert((0.0, 0.0, 0));
-                    entry.0 += lat;
-                    entry.1 += lon;
-                    entry.2 += 1;
-                }
+        let (lat, lon, city_opt) = match obj {
+            GeoObject::Address(addr) => (addr.lat, addr.lon, addr.city.as_ref()),
+            GeoObject::Named(named) => (named.lat, named.lon, named.city.as_ref()),
+        };
+        if let Some(city) = city_opt {
+            if !city.is_empty() {
+                let entry = city_coords.entry(city.clone()).or_insert((0.0, 0.0, 0));
+                entry.0 += lat;
+                entry.1 += lon;
+                entry.2 += 1;
             }
         }
     }
@@ -365,31 +367,104 @@ pub fn infer_missing_cities(objects: &mut [GeoObject]) {
     // 2. Для адресов без города находим ближайший
     let mut assigned = 0u64;
     for obj in objects.iter_mut() {
-        if let GeoObject::Address(addr) = obj {
-            if addr.city.as_ref().map_or(true, |c| c.is_empty()) {
-                let mut best_city: Option<&str> = None;
-                let mut best_dist = f64::MAX;
+        let (lat, lon, city_ref) = match obj {
+            GeoObject::Address(addr) => (addr.lat, addr.lon, &mut addr.city),
+            GeoObject::Named(named) => (named.lat, named.lon, &mut named.city),
+        };
+        if city_ref.as_ref().map_or(true, |c| c.is_empty()) {
+            let mut best_city: Option<&str> = None;
+            let mut best_dist = f64::MAX;
 
-                for &(city_name, city_lat, city_lon) in &centroids {
-                    let dist = haversine_approx(addr.lat, addr.lon, city_lat, city_lon);
-                    if dist < best_dist {
-                        best_dist = dist;
-                        best_city = Some(city_name);
-                    }
+            for &(city_name, city_lat, city_lon) in &centroids {
+                let dist = haversine_approx(lat, lon, city_lat, city_lon);
+                if dist < best_dist {
+                    best_dist = dist;
+                    best_city = Some(city_name);
                 }
+            }
 
-                if let Some(city) = best_city {
-                    addr.city = Some(city.to_string());
-                    assigned += 1;
-                }
+            if let Some(city) = best_city {
+                *city_ref = Some(city.to_string());
+                assigned += 1;
             }
         }
     }
 
     if assigned > 0 {
         log::info!(
-            "Привязка городов: {} адресам без города назначен ближайший город (из {} известных)",
+            "Привязка городов: {} объектам без города назначен ближайший город (из {} известных)",
             assigned, centroids.len()
+        );
+    }
+}
+
+/// Проставить страну для всех объектов, у которых она не задана.
+///
+/// Источники (в порядке приоритета):
+/// 1. Если страна уже задана в объекте — не трогаем.
+/// 2. Если известен город — ищем страну по другим объектам в том же городе.
+/// 3. Извлекаем код страны из кода региона (напр. "RU-CFD" → "RU").
+pub fn infer_missing_countries(objects: &mut [GeoObject], region_code: Option<&str>) {
+    use std::collections::HashMap;
+
+    // 1. Строим карту «город → страна» по объектам, где известны оба
+    let mut city_country: HashMap<String, String> = HashMap::new();
+    for obj in objects.iter() {
+        let (city_opt, country_opt) = match obj {
+            GeoObject::Address(addr) => (addr.city.as_ref(), addr.country.as_ref()),
+            GeoObject::Named(named) => (named.city.as_ref(), named.country.as_ref()),
+        };
+        if let (Some(city), Some(country)) = (city_opt, country_opt) {
+            if !city.is_empty() && !country.is_empty() {
+                city_country.entry(city.clone()).or_insert_with(|| country.clone());
+            }
+        }
+    }
+
+    // 2. Извлекаем код страны из региона (первые 2 символа до дефиса или всё)
+    let region_country = region_code
+        .and_then(|r| r.split(['-', '_']).next())
+        .filter(|c| c.len() == 2 && c.chars().all(|ch| ch.is_ascii_uppercase()));
+
+    // 3. Проставляем страну
+    let mut assigned = 0u64;
+    for obj in objects.iter_mut() {
+        // Извлекаем город ДО мутабельного заимствования страны
+        let city_opt: Option<String> = match obj {
+            &mut GeoObject::Address(ref addr) => addr.city.clone(),
+            &mut GeoObject::Named(ref named) => named.city.clone(),
+        };
+
+        let country_ref: &mut Option<String> = match obj {
+            GeoObject::Address(addr) => &mut addr.country,
+            GeoObject::Named(named) => &mut named.country,
+        };
+
+        // Уже задана — пропускаем
+        if country_ref.as_ref().map_or(false, |c| !c.is_empty()) {
+            continue;
+        }
+
+        // Пробуем найти страну по городу
+        if let Some(ref city) = city_opt {
+            if let Some(country) = city_country.get(city.as_str()) {
+                *country_ref = Some(country.clone());
+                assigned += 1;
+                continue;
+            }
+        }
+
+        // Fallback: из кода региона
+        if let Some(rc) = region_country {
+            *country_ref = Some(rc.to_string());
+            assigned += 1;
+        }
+    }
+
+    if assigned > 0 {
+        log::info!(
+            "Привязка стран: {} объектам проставлена страна (городская карта: {} городов, регион: {:?})",
+            assigned, city_country.len(), region_country
         );
     }
 }
@@ -407,11 +482,13 @@ pub fn merge_typo_cities(objects: &mut [GeoObject]) {
     // 1. Считаем частоты городов
     let mut city_counts: HashMap<String, u64> = HashMap::new();
     for obj in objects.iter() {
-        if let GeoObject::Address(addr) = obj {
-            if let Some(ref city) = addr.city {
-                if !city.is_empty() {
-                    *city_counts.entry(city.clone()).or_default() += 1;
-                }
+        let city_opt = match obj {
+            GeoObject::Address(addr) => addr.city.as_ref(),
+            GeoObject::Named(named) => named.city.as_ref(),
+        };
+        if let Some(city) = city_opt {
+            if !city.is_empty() {
+                *city_counts.entry(city.clone()).or_default() += 1;
             }
         }
     }
@@ -445,55 +522,22 @@ pub fn merge_typo_cities(objects: &mut [GeoObject]) {
     // 4. Применяем замены
     let mut merged = 0u64;
     for obj in objects.iter_mut() {
-        if let GeoObject::Address(addr) = obj {
-            if let Some(ref city) = addr.city {
-                if let Some(fixed) = replacements.get(city) {
-                    addr.city = Some(fixed.clone());
-                    merged += 1;
-                }
+        let city_ref: &mut Option<String> = match obj {
+            GeoObject::Address(addr) => &mut addr.city,
+            GeoObject::Named(named) => &mut named.city,
+        };
+        if let Some(city) = city_ref.as_deref() {
+            if let Some(fixed) = replacements.get(city) {
+                *city_ref = Some(fixed.clone());
+                merged += 1;
             }
         }
     }
 
     log::info!(
-        "Склеивание опечаток: {} городов исправлено, {} адресов переназначено",
+        "Склеивание опечаток: {} городов исправлено, {} объектов переназначено",
         replacements.len(), merged
     );
-}
-
-/// Расстояние Левенштейна между двумя строками.
-fn levenshtein_distance(a: &str, b: &str) -> usize {
-    let a_chars: Vec<char> = a.chars().collect();
-    let b_chars: Vec<char> = b.chars().collect();
-    let n = a_chars.len();
-    let m = b_chars.len();
-
-    let mut prev: Vec<usize> = (0..=m).collect();
-    let mut curr = vec![0usize; m + 1];
-
-    for i in 1..=n {
-        curr[0] = i;
-        for j in 1..=m {
-            let cost = if a_chars[i - 1] == b_chars[j - 1] { 0 } else { 1 };
-            curr[j] = (prev[j] + 1)           // удаление
-                .min(curr[j - 1] + 1)          // вставка
-                .min(prev[j - 1] + cost);      // замена
-        }
-        std::mem::swap(&mut prev, &mut curr);
-    }
-
-    prev[m]
-}
-
-/// Приближённое расстояние Хаверсина в метрах (для сравнения, не для навигации).
-fn haversine_approx(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
-    let r = 6_371_000.0;
-    let dlat = (lat2 - lat1).to_radians();
-    let dlon = (lon2 - lon1).to_radians();
-    let a = (dlat / 2.0).sin().powi(2)
-        + lat1.to_radians().cos() * lat2.to_radians().cos() * (dlon / 2.0).sin().powi(2);
-    let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
-    r * c
 }
 
 /// Извлечь Address из тегов.
@@ -579,20 +623,16 @@ fn correct_field(value: Option<String>, corrector: Option<&Corrector>) -> Option
 
 /// Извлечь NamedObject из тегов. Только русское имя + транслитерация.
 ///
-/// В базу попадают три категории POI:
+/// В базу попадают две категории POI:
 /// - **historic** — объекты культурного наследия, памятники, мемориалы
-/// - **shop** — объекты торговли (магазины, супермаркеты, ТЦ)
 /// - **tourism** — туристические объекты (зоопарки, музеи, отели, ...)
 ///
-/// Всё остальное (транспорт, дороги, досуг, офисы, природные объекты и т.д.)
+/// Всё остальное (магазины, транспорт, дороги, досуг, офисы, природные объекты и т.д.)
 /// в Named-индекс не включается.
 fn extract_named_object(tags: &HashMap<String, String>, lat: f64, lon: f64, corrector: Option<&Corrector>) -> Option<NamedObject> {
     // Требуем ровно одну из допустимых категорий — иначе это не целевой POI.
-    // Возвращаем КЛЮЧ тега (historic/shop/tourism) — он нужен для category_to_tag.
     let (category_key, _category_value) = if let Some(v) = tags.get("historic") {
         ("historic", v)
-    } else if let Some(v) = tags.get("shop") {
-        ("shop", v)
     } else if let Some(v) = tags.get("tourism") {
         ("tourism", v)
     } else {
@@ -606,12 +646,17 @@ fn extract_named_object(tags: &HashMap<String, String>, lat: f64, lon: f64, corr
         corrector,
     )?;
 
-    let translit = crate::translit::transliterate(&name);
+    let country = tags.get("addr:country").cloned();
+    let city = tags.get("addr:city")
+        .or_else(|| tags.get("addr:town"))
+        .or_else(|| tags.get("addr:place"))
+        .cloned();
 
     Some(NamedObject {
         name,
-        translit,
         category: Some(category_key.to_string()),
+        country,
+        city,
         lat,
         lon,
     })
@@ -654,18 +699,15 @@ mod tests {
         let obj = extract_named_object(&tags, 55.75, 37.62, None).unwrap();
         assert_eq!(obj.name, "Красная площадь");
         assert_eq!(obj.category.as_deref().unwrap(), "historic");
-        // Кириллическое имя → транслитерация должна быть
-        assert!(obj.translit.is_some());
     }
 
     #[test]
-    fn test_extract_named_object_shop() {
+    fn test_extract_named_object_excluded_shop() {
+        // shop исключён из whitelist — должен вернуть None
         let mut tags = HashMap::new();
         tags.insert("name".to_string(), "Пятёрочка".to_string());
         tags.insert("shop".to_string(), "supermarket".to_string());
-        let obj = extract_named_object(&tags, 0.0, 0.0, None).unwrap();
-        assert_eq!(obj.name, "Пятёрочка");
-        assert_eq!(obj.category.as_deref().unwrap(), "shop");
+        assert!(extract_named_object(&tags, 0.0, 0.0, None).is_none());
     }
 
     #[test]
