@@ -19,6 +19,19 @@ use crate::source::FeatureSource;
 const GOL_VERSION: &str = "2.3.2";
 const GOL_BASE_URL: &str = "https://github.com/clarisma/geodesk-gol/releases/download";
 
+/// GOQL для адресных фич.
+///
+/// В gol 2.3.2 есть баги движка запросов: смешивание ключей `addr:*` с другими
+/// ключами в одном multi-selector-запросе даёт неверный результат, а унарный
+/// тест `[addr:housenumber]` занижает результат для тегов с числовыми значениями.
+/// Поэтому адреса выбираются отдельным запросом, а его PBF-вывод объединяется
+/// с запросом POI/мест (см. [`GolSource::parse`]).
+const GOL_ADDR_QUERY: &str = "*[addr:street], *[addr:city], *[addr:town], *[addr:place]";
+
+/// GOQL для POI и типов мест. `place`/`landuse=allotments` нужны для
+/// подстановки улиц у адресов без `addr:street`.
+const GOL_POI_QUERY: &str = "*[historic], *[tourism], *[place], *[landuse=allotments]";
+
 /// Обёртка над self-contained исполняемым файлом `gol` (GeoDesk GOL Tool).
 pub struct GolTool {
     binary: PathBuf,
@@ -164,16 +177,23 @@ impl FeatureSource for GolSource {
 
     fn parse(&mut self, path: &Path) -> Result<Vec<GeoObject>> {
         let tool = GolTool::find_or_install()?;
-        let temp = temp_pbf_path(path);
+        let temp = temp_pbf_path(path, "addr");
+        let temp_poi = temp_pbf_path(path, "poi");
 
-        tool.query_to_pbf(path, "*", &temp)?;
+        // Два отдельных запроса из-за багов multi-selector в gol 2.3.2,
+        // затем объединяем PBF-потоки: PBF — последовательность независимых
+        // блоков, поэтому конкатенация даёт валидный файл.
+        tool.query_to_pbf(path, GOL_ADDR_QUERY, &temp)?;
+        tool.query_to_pbf(path, GOL_POI_QUERY, &temp_poi)?;
+        append_file(&temp_poi, &temp)?;
 
         let mut parser = crate::parser::PbfParser::new();
         parser.set_corrector(self.corrector.take());
         let result = parser.parse_file(&temp);
 
-        // Временный PBF больше не нужен; ошибку удаления игнорируем.
+        // Временные PBF больше не нужны; ошибки удаления игнорируем.
         let _ = std::fs::remove_file(&temp);
+        let _ = std::fs::remove_file(&temp_poi);
 
         result
     }
@@ -194,13 +214,24 @@ fn cache_dir() -> PathBuf {
 }
 
 /// Временный PBF-файл для экспорта GOL (уникальный на процесс).
-fn temp_pbf_path(gol: &Path) -> PathBuf {
+fn temp_pbf_path(gol: &Path, tag: &str) -> PathBuf {
     let stem = gol
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("gol");
-    let name = format!("osm-geo-{}-{}.osm.pbf", stem, std::process::id());
+    let name = format!("osm-geo-{}-{}-{}.osm.pbf", stem, std::process::id(), tag);
     std::env::temp_dir().join(name)
+}
+
+/// Дописать содержимое `src` в конец `dst`.
+fn append_file(src: &Path, dst: &Path) -> Result<()> {
+    let mut out = std::fs::OpenOptions::new()
+        .append(true)
+        .open(dst)
+        .with_context(|| format!("Открытие {}", dst.display()))?;
+    let mut inp = File::open(src).with_context(|| format!("Открытие {}", src.display()))?;
+    std::io::copy(&mut inp, &mut out).context("Объединение PBF")?;
+    Ok(())
 }
 
 fn download_url() -> Result<String> {
