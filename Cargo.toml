@@ -27,6 +27,8 @@ serde_json = "1"
 zstd = "0.13"
 # Gzip decompression
 flate2 = "1"
+# Zip extraction (for downloading the gol tool)
+zip = "2"
 # Hashing
 sha2 = "0.10"
 # HTTP client (download)

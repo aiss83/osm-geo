@@ -51,13 +51,6 @@ impl PbfParser {
         }
     }
 
-    /// Включить коррекцию опечаток (SymSpell).
-    /// Словарь загружается из `data/ru_full.txt` (скачивается при необходимости).
-    pub fn with_corrector(mut self, corrector: Corrector) -> Self {
-        self.corrector = Some(corrector);
-        self
-    }
-
     /// Быстрый проход по PBF: собрать place/landuse-типы для всех именованных мест.
     /// Возвращает общее число элементов в файле для точного прогресса основного прохода.
     fn collect_place_types(&mut self, path: &Path) -> Result<u64> {
@@ -325,6 +318,16 @@ impl PbfParser {
             self.addresses,
             self.named_objects,
         )
+    }
+}
+
+impl crate::source::FeatureSource for PbfParser {
+    fn set_corrector(&mut self, corrector: Option<Corrector>) {
+        self.corrector = corrector;
+    }
+
+    fn parse(&mut self, path: &Path) -> Result<Vec<GeoObject>> {
+        self.parse_file(path)
     }
 }
 

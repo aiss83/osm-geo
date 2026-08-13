@@ -2,6 +2,7 @@
 //!
 //! Основные команды:
 //!   build   — сборка базы для региона
+//!   convert — конвертация OSM PBF в GeoDesk GOL
 //!   query   — тестовый поиск в собранной базе
 //!   info    — вывод метаданных о базе
 
@@ -10,10 +11,12 @@ mod corrector;
 mod dedup;
 mod downloader;
 mod finalizer;
+mod gol;
 mod indexer;
 mod model;
 mod normalizer;
 mod parser;
+mod source;
 mod utils;
 
 use anyhow::Result;
@@ -57,6 +60,25 @@ enum Commands {
         /// Можно указать несколько: -f sqlite -f compact
         #[arg(short, long, default_value = "sqlite")]
         format: Vec<String>,
+
+        /// Источник данных: auto (по расширению), pbf или gol
+        #[arg(long, default_value = "auto")]
+        source: String,
+    },
+
+    /// Конвертировать OSM PBF в GeoDesk GOL
+    Convert {
+        /// Входной PBF-файл (локальный путь или регион Geofabrik)
+        #[arg(short, long)]
+        input: String,
+
+        /// Выходной GOL-файл (по умолчанию: {stem}.gol)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// Путь к исполняемому файлу `gol` (по умолчанию — из PATH/кэша)
+        #[arg(long)]
+        gol_bin: Option<PathBuf>,
     },
 
     /// Тестовый поиск в собранной базе
@@ -107,7 +129,13 @@ fn main() -> Result<()> {
             output,
             region,
             format,
-        } => cmd_build(&input, output.as_ref(), region.as_deref(), &format),
+            source,
+        } => cmd_build(&input, output.as_ref(), region.as_deref(), &format, &source),
+        Commands::Convert {
+            input,
+            output,
+            gol_bin,
+        } => cmd_convert(&input, output.as_ref(), gol_bin.as_ref()),
         Commands::Query { db, query } => cmd_query(&db, &query),
         Commands::Info { db } => cmd_info(&db),
         Commands::List { region } => cmd_list(region.as_deref()),
@@ -120,6 +148,7 @@ fn cmd_build(
     output: Option<&PathBuf>,
     region: Option<&str>,
     formats: &[String],
+    source_kind: &str,
 ) -> Result<()> {
     info!("=== Сборка базы данных ===");
 
@@ -147,18 +176,27 @@ fn cmd_build(
     info!("Выходной файл (stem): {:?}", output_stem);
     info!("Форматы: {:?}", formats);
 
-    // 3. Парсинг PBF
+    // 3. Парсинг источника (PBF или GOL)
     let corrector = corrector::Corrector::new_or_download()
         .map_err(|e| {
             log::warn!("Не удалось загрузить корректор опечаток: {} (продолжаем без коррекции)", e);
             e
         })
         .ok();
-    let mut parser = parser::PbfParser::new();
-    if let Some(c) = corrector {
-        parser = parser.with_corrector(c);
-    }
-    let mut objects = parser.parse_file(&input_path)?;
+
+    let kind = match source_kind {
+        "auto" => source::detect_source(&input_path),
+        "pbf" => source::SourceKind::Pbf,
+        "gol" => source::SourceKind::Gol,
+        other => anyhow::bail!("Неизвестный --source: '{}'. Допустимо: auto, pbf, gol", other),
+    };
+
+    let mut src: Box<dyn source::FeatureSource> = match kind {
+        source::SourceKind::Pbf => Box::new(parser::PbfParser::new()),
+        source::SourceKind::Gol => Box::new(gol::GolSource::new()),
+    };
+    src.set_corrector(corrector);
+    let mut objects = src.parse(&input_path)?;
     info!("Извлечено {} объектов", objects.len());
 
     // 4. Привязка адресов без города к ближайшему городу
@@ -270,6 +308,36 @@ fn cmd_build(
     info!("=== Сборка завершена ===");
     info!("Объектов: {}", count);
 
+    Ok(())
+}
+
+/// Команда convert: конвертация OSM PBF → GeoDesk GOL.
+fn cmd_convert(input: &str, output: Option<&PathBuf>, gol_bin: Option<&PathBuf>) -> Result<()> {
+    info!("=== Конвертация PBF → GOL ===");
+
+    // 1. Разрешаем входной файл (локальный, регион Geofabrik или URL)
+    let input_path = resolve_input(input)?;
+    info!("Входной PBF: {:?}", input_path);
+
+    // 2. Выходной GOL-файл
+    let output_path = match output {
+        Some(p) => p.clone(),
+        None => {
+            let stem = downloader::derive_output_stem(&input_path);
+            PathBuf::from(format!("{}.gol", stem))
+        }
+    };
+
+    // 3. Находим/устанавливаем утилиту gol
+    let tool = match gol_bin {
+        Some(p) => gol::GolTool::new(p.clone()),
+        None => gol::GolTool::find_or_install()?,
+    };
+
+    // 4. Конвертация
+    tool.build(&input_path, &output_path)?;
+    info!("Создан GOL: {:?}", output_path);
+    info!("=== Конвертация завершена ===");
     Ok(())
 }
 
