@@ -101,22 +101,24 @@ impl Corrector {
 
         let file = std::fs::File::open(dict_path)
             .context("Открытие файла словаря")?;
-        let file_size = file.metadata()?.len();
+
+        // Прогресс считаем по строкам: каждая строка — одна вставка в SymSpell,
+        // поэтому байтовый прогресс не отражает реальную долю выполненной работы.
+        let total_lines = BufReader::new(&file).lines().count() as u64;
         let reader = BufReader::new(file);
 
-        let pb = indicatif::ProgressBar::new(file_size);
+        let pb = indicatif::ProgressBar::new(total_lines);
         pb.set_style(
             indicatif::ProgressStyle::default_bar()
-                .template("{spinner:.green} [{elapsed_precise}] Загрузка словаря SymSpell: {bytes}/{total_bytes} ({bytes_per_sec})")
+                .template("{spinner:.green} [{elapsed_precise}] Загрузка словаря SymSpell: {percent:>3}% [{bar:40}] {pos}/{len} строк, ETA {eta}")
                 .unwrap()
                 .progress_chars("##-"),
         );
 
         for line in reader.lines() {
             let line = line.context("Чтение строки словаря")?;
-            let line_len = line.len() as u64 + 1; // +1 за отброшенный \n
             symspell.load_dictionary_line(&line, 0, 1, " ");
-            pb.inc(line_len);
+            pb.inc(1);
         }
 
         pb.finish_with_message("Словарь SymSpell загружен");

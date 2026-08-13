@@ -59,9 +59,24 @@ impl PbfParser {
     }
 
     /// Быстрый проход по PBF: собрать place/landuse-типы для всех именованных мест.
-    fn collect_place_types(&mut self, path: &Path) -> Result<()> {
+    /// Возвращает общее число элементов в файле для точного прогресса основного прохода.
+    fn collect_place_types(&mut self, path: &Path) -> Result<u64> {
         let reader = ElementReader::from_path(path)?;
+
+        // Точный прогресс здесь невозможен: общее число элементов мы узнаём
+        // только в конце этого прохода. Показываем счётчик + спиннер.
+        let pb = ProgressBar::new_spinner();
+        pb.enable_steady_tick(std::time::Duration::from_millis(80));
+        pb.set_style(
+            ProgressStyle::with_template(
+                "{spinner:.green} [{elapsed_precise}] Сбор типов мест: {pos} элементов",
+            )
+            .unwrap(),
+        );
+
+        let mut total: u64 = 0;
         reader.for_each(|element| {
+            total += 1;
             let tags: HashMap<String, String> = match &element {
                 Element::Node(n) => n.tags().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
                 Element::DenseNode(n) => n.tags().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
@@ -75,9 +90,11 @@ impl PbfParser {
                         .or_insert(place_type);
                 }
             }
+            pb.inc(1);
         })?;
-        info!("Собрано типов мест: {}", self.place_types.len());
-        Ok(())
+
+        pb.finish_with_message(format!("Собрано типов мест: {}", self.place_types.len()));
+        Ok(total)
     }
 
     /// Разобрать PBF-файл и вернуть вектор GeoObject.
@@ -85,30 +102,24 @@ impl PbfParser {
         info!("Парсинг PBF-файла: {:?}", path);
 
         // Предварительный проход: собираем типы населённых пунктов
-        self.collect_place_types(path)?;
+        // и общее число элементов для точного прогресса.
+        let total_elements = self.collect_place_types(path)?;
 
-        let file_size = std::fs::metadata(path)
-            .map(|m| m.len())
-            .unwrap_or(0);
-        let pb = ProgressBar::new(file_size);
+        let pb = ProgressBar::new(total_elements);
         pb.set_style(
             ProgressStyle::default_bar()
-                .template("{spinner:.green} [{elapsed_precise}] Парсинг PBF: {bytes}/{total_bytes} ({bytes_per_sec}) — объектов: {msg}")
+                .template("{spinner:.green} [{elapsed_precise}] Парсинг PBF: {percent:>3}% [{bar:40}] {pos}/{len} элементов, ETA {eta}")
                 .unwrap()
                 .progress_chars("##-"),
         );
-        pb.set_message("0".to_string());
 
         let reader = ElementReader::from_path(path)?;
         let mut objects = Vec::new();
-        let mut pb_bytes: u64 = 0;
-        const PB_FLUSH: u64 = 2_000_000; // обновляем progress bar каждые ~2 МБ
 
         reader.for_each(|element| {
             match element {
                 Element::Node(node) => {
                     self.nodes += 1;
-                    pb_bytes += 128;
                     let id = node.id();
 
                     self.node_coords.insert(id, (node.lat(), node.lon()));
@@ -121,7 +132,6 @@ impl PbfParser {
                 }
                 Element::DenseNode(node) => {
                     self.nodes += 1;
-                    pb_bytes += 64;
                     let id = node.id();
 
                     self.node_coords.insert(id, (node.lat(), node.lon()));
@@ -134,7 +144,6 @@ impl PbfParser {
                 }
                 Element::Way(way) => {
                     self.ways += 1;
-                    pb_bytes += 256;
                     let way_id = way.id();
                     let tags: HashMap<String, String> = way
                         .tags()
@@ -150,7 +159,6 @@ impl PbfParser {
                 }
                 Element::Relation(rel) => {
                     self.relations += 1;
-                    pb_bytes += 512;
                     let tags: HashMap<String, String> = rel
                         .tags()
                         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -160,17 +168,9 @@ impl PbfParser {
                 }
             }
 
-            if pb_bytes >= PB_FLUSH {
-                pb.set_position(pb.position() + pb_bytes);
-                pb_bytes = 0;
-            }
+            pb.inc(1);
         })?;
 
-        if pb_bytes > 0 {
-            pb.set_position(pb.position() + pb_bytes);
-        }
-
-        pb.set_message(format!("{}", objects.len()));
         pb.finish_with_message(format!("Извлечено {} объектов", objects.len()));
 
         info!("Кэш нод: {} записей, way'ев: {}", self.node_coords.len(), self.way_coords.len());
