@@ -25,3 +25,6 @@ __pycache__/
 # Tools
 .codewhale/
 dist/
+
+# GeoDesk GOL (build artifacts)
+*.gol
