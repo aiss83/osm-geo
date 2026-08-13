@@ -1,12 +1,13 @@
 //! Интеграция с GeoDesk GOL.
 //!
 //! - Этап 1: конвертация OSM PBF → GOL через утилиту `gol` ([`GolTool`]).
-//! - Этап 2: заглушка источника [`GolSource`] (чтение GOL — на этапе 3).
+//! - Этап 3: чтение GOL как источника гео-объектов ([`GolSource`]) через
+//!   `gol query -f pbf` + повторное использование PBF-парсера.
 
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context, Result};
 use log::info;
@@ -34,6 +35,13 @@ impl GolTool {
     pub fn find_or_install() -> Result<Self> {
         let name = binary_name();
 
+        // 1. Локальный бинарь в каталоге gol/ проекта (если пользователь положил его сам)
+        let local = Path::new("gol").join(name);
+        if local.is_file() {
+            return Ok(Self { binary: local });
+        }
+
+        // 2. В PATH
         if let Some(path) = find_in_path(name) {
             return Ok(Self { binary: path });
         }
@@ -104,12 +112,41 @@ impl GolTool {
         }
         Ok(())
     }
+
+    /// Выгрузить результаты GOQL-запроса из GOL в формате OSM PBF.
+    ///
+    /// Используется как «путь A» из плана: экспортируем нужные фичи в PBF и
+    /// отдаём их существующему PBF-парсеру. Для полной геометрии way/relation
+    /// GOL должен быть собран с `--waynode-ids` (это делает [`Self::build`]).
+    pub fn query_to_pbf(&self, gol: &Path, query: &str, out: &Path) -> Result<()> {
+        info!("gol query {} '{}' -f pbf", gol.display(), query);
+
+        let output = File::create(out)
+            .with_context(|| format!("Создание файла {}", out.display()))?;
+
+        let status = Command::new(&self.binary)
+            .arg("query")
+            .arg(gol)
+            .arg(query)
+            .arg("-f")
+            .arg("pbf")
+            .stdout(Stdio::from(output))
+            .stderr(Stdio::inherit())
+            .status()
+            .with_context(|| format!("Запуск '{}'", self.binary.display()))?;
+
+        if !status.success() {
+            bail!("gol query завершился с ошибкой (статус {:?})", status.code());
+        }
+        Ok(())
+    }
 }
 
 /// Источник гео-объектов из GOL.
 ///
-/// Чтение будет реализовано на этапе 3; сейчас это заглушка, чтобы
-/// унифицированный интерфейс и автоопределение формата уже работали.
+/// Экспортирует GOL во временный PBF (`gol query '*' -f pbf`) и повторно
+/// использует PBF-парсер, поэтому извлечение адресов/POI, сбор типов мест и
+/// расчёт центроидов полностью совпадают с прямым разбором PBF.
 pub struct GolSource {
     corrector: Option<Corrector>,
 }
@@ -126,11 +163,19 @@ impl FeatureSource for GolSource {
     }
 
     fn parse(&mut self, path: &Path) -> Result<Vec<GeoObject>> {
-        let _ = self.corrector.as_ref();
-        bail!(
-            "Чтение GOL-файла ({:?}) будет реализовано на этапе 3",
-            path
-        );
+        let tool = GolTool::find_or_install()?;
+        let temp = temp_pbf_path(path);
+
+        tool.query_to_pbf(path, "*", &temp)?;
+
+        let mut parser = crate::parser::PbfParser::new();
+        parser.set_corrector(self.corrector.take());
+        let result = parser.parse_file(&temp);
+
+        // Временный PBF больше не нужен; ошибку удаления игнорируем.
+        let _ = std::fs::remove_file(&temp);
+
+        result
     }
 }
 
@@ -146,6 +191,16 @@ fn binary_name() -> &'static str {
 
 fn cache_dir() -> PathBuf {
     Path::new("data").join("tools")
+}
+
+/// Временный PBF-файл для экспорта GOL (уникальный на процесс).
+fn temp_pbf_path(gol: &Path) -> PathBuf {
+    let stem = gol
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("gol");
+    let name = format!("osm-geo-{}-{}.osm.pbf", stem, std::process::id());
+    std::env::temp_dir().join(name)
 }
 
 fn download_url() -> Result<String> {
