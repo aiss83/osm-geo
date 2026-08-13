@@ -2,6 +2,25 @@
 
 use std::time::SystemTime;
 
+use indicatif::{ProgressBar, ProgressStyle};
+
+/// Создать прогресс-бар единого стиля для этапов пост-обработки.
+///
+/// `label` выводится в начале строки; прогресс считается по `len` элементов.
+pub fn progress_bar(len: u64, label: &str) -> ProgressBar {
+    let pb = ProgressBar::new(len);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template(
+                "{spinner:.green} [{elapsed_precise}] {msg}: {percent:>3}% [{bar:40}] {pos}/{len}, ETA {eta}",
+            )
+            .unwrap()
+            .progress_chars("##-"),
+    );
+    pb.set_message(label.to_string());
+    pb
+}
+
 /// Расстояние Левенштейна между двумя строками (edit distance).
 pub fn levenshtein_distance(a: &str, b: &str) -> usize {
     let a_chars: Vec<char> = a.chars().collect();

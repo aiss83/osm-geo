@@ -300,6 +300,7 @@ impl Normalizer {
     /// Кэширует результаты: одинаковые названия нормализуются один раз.
     pub fn normalize_objects(&mut self, objects: Vec<GeoObject>) -> Vec<GeoObject> {
         let mut result = Vec::with_capacity(objects.len());
+        let pb = crate::utils::progress_bar(objects.len() as u64, "Нормализация названий");
 
         for obj in objects {
             let obj = match obj {
@@ -327,7 +328,9 @@ impl Normalizer {
                 }
             };
             result.push(obj);
+            pb.inc(1);
         }
+        pb.finish_and_clear();
 
         if !self.cache.is_empty() {
             log::info!(

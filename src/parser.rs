@@ -340,6 +340,7 @@ pub fn infer_missing_cities(objects: &mut [GeoObject]) {
 
     // 1. Собираем центроиды городов (усреднённые координаты адресов с известным городом)
     let mut city_coords: HashMap<String, (f64, f64, u64)> = HashMap::new();
+    let pb = crate::utils::progress_bar(objects.len() as u64, "Сбор центроидов городов");
     for obj in objects.iter() {
         let (lat, lon, city_opt) = match obj {
             GeoObject::Address(addr) => (addr.lat, addr.lon, addr.city.as_ref()),
@@ -353,7 +354,9 @@ pub fn infer_missing_cities(objects: &mut [GeoObject]) {
                 entry.2 += 1;
             }
         }
+        pb.inc(1);
     }
+    pb.finish_and_clear();
 
     if city_coords.is_empty() {
         return;
@@ -369,6 +372,7 @@ pub fn infer_missing_cities(objects: &mut [GeoObject]) {
 
     // 2. Для адресов без города находим ближайший
     let mut assigned = 0u64;
+    let pb = crate::utils::progress_bar(objects.len() as u64, "Привязка к ближайшему городу");
     for obj in objects.iter_mut() {
         let (lat, lon, city_ref) = match obj {
             GeoObject::Address(addr) => (addr.lat, addr.lon, &mut addr.city),
@@ -391,7 +395,9 @@ pub fn infer_missing_cities(objects: &mut [GeoObject]) {
                 assigned += 1;
             }
         }
+        pb.inc(1);
     }
+    pb.finish_and_clear();
 
     if assigned > 0 {
         log::info!(
@@ -412,6 +418,7 @@ pub fn infer_missing_countries(objects: &mut [GeoObject], region_code: Option<&s
 
     // 1. Строим карту «город → страна» по объектам, где известны оба
     let mut city_country: HashMap<String, String> = HashMap::new();
+    let pb = crate::utils::progress_bar(objects.len() as u64, "Сбор карты город → страна");
     for obj in objects.iter() {
         let (city_opt, country_opt) = match obj {
             GeoObject::Address(addr) => (addr.city.as_ref(), addr.country.as_ref()),
@@ -422,7 +429,9 @@ pub fn infer_missing_countries(objects: &mut [GeoObject], region_code: Option<&s
                 city_country.entry(city.clone()).or_insert_with(|| country.clone());
             }
         }
+        pb.inc(1);
     }
+    pb.finish_and_clear();
 
     // 2. Извлекаем код страны из региона (первые 2 символа до дефиса или всё)
     let region_country = region_code
@@ -431,7 +440,9 @@ pub fn infer_missing_countries(objects: &mut [GeoObject], region_code: Option<&s
 
     // 3. Проставляем страну
     let mut assigned = 0u64;
+    let pb = crate::utils::progress_bar(objects.len() as u64, "Привязка страны");
     for obj in objects.iter_mut() {
+        pb.inc(1);
         // Извлекаем город ДО мутабельного заимствования страны
         let city_opt: Option<String> = match obj {
             &mut GeoObject::Address(ref addr) => addr.city.clone(),
@@ -463,6 +474,7 @@ pub fn infer_missing_countries(objects: &mut [GeoObject], region_code: Option<&s
             assigned += 1;
         }
     }
+    pb.finish_and_clear();
 
     if assigned > 0 {
         log::info!(
@@ -484,6 +496,7 @@ pub fn merge_typo_cities(objects: &mut [GeoObject]) {
 
     // 1. Считаем частоты городов
     let mut city_counts: HashMap<String, u64> = HashMap::new();
+    let pb = crate::utils::progress_bar(objects.len() as u64, "Подсчёт частот городов");
     for obj in objects.iter() {
         let city_opt = match obj {
             GeoObject::Address(addr) => addr.city.as_ref(),
@@ -494,7 +507,9 @@ pub fn merge_typo_cities(objects: &mut [GeoObject]) {
                 *city_counts.entry(city.clone()).or_default() += 1;
             }
         }
+        pb.inc(1);
     }
+    pb.finish_and_clear();
 
     // 2. Сортируем по убыванию частоты: частые — канонические кандидаты
     let mut sorted: Vec<(String, u64)> = city_counts.into_iter().collect();
@@ -502,6 +517,7 @@ pub fn merge_typo_cities(objects: &mut [GeoObject]) {
 
     // 3. Для каждого города ищем каноническую замену среди более частых
     let mut replacements: HashMap<String, String> = HashMap::new();
+    let pb = crate::utils::progress_bar(sorted.len() as u64, "Поиск опечаток городов");
     for (i, (city, count)) in sorted.iter().enumerate() {
         // Ищем среди более частых городов ближайший по Левенштейну
         for (canonical, canon_count) in sorted[..i].iter() {
@@ -516,7 +532,9 @@ pub fn merge_typo_cities(objects: &mut [GeoObject]) {
                 break;
             }
         }
+        pb.inc(1);
     }
+    pb.finish_and_clear();
 
     if replacements.is_empty() {
         return;
@@ -524,6 +542,7 @@ pub fn merge_typo_cities(objects: &mut [GeoObject]) {
 
     // 4. Применяем замены
     let mut merged = 0u64;
+    let pb = crate::utils::progress_bar(objects.len() as u64, "Применение замен городов");
     for obj in objects.iter_mut() {
         let city_ref: &mut Option<String> = match obj {
             GeoObject::Address(addr) => &mut addr.city,
@@ -535,7 +554,9 @@ pub fn merge_typo_cities(objects: &mut [GeoObject]) {
                 merged += 1;
             }
         }
+        pb.inc(1);
     }
+    pb.finish_and_clear();
 
     log::info!(
         "Склеивание опечаток: {} городов исправлено, {} объектов переназначено",
