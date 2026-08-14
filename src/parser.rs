@@ -370,7 +370,21 @@ pub fn infer_missing_cities(objects: &mut [GeoObject]) {
         })
         .collect();
 
-    // 2. Для адресов без города находим ближайший
+    // 2. Строим равномерную пространственную сетку для быстрого поиска.
+    //    Поиск остаётся точным: клетки расширяются кольцами, пока нижняя
+    //    граница расстояния до следующего кольца не превысит найденный минимум.
+    const CELL_DEG: f64 = 0.05; // ~5.5 км по меридиану
+    let mut grid: HashMap<(i64, i64), Vec<(&str, f64, f64)>> = HashMap::new();
+    let mut max_abs_lat: f64 = 0.0;
+    for &(name, lat, lon) in &centroids {
+        let cx = (lon / CELL_DEG).floor() as i64;
+        let cy = (lat / CELL_DEG).floor() as i64;
+        grid.entry((cx, cy)).or_default().push((name, lat, lon));
+        max_abs_lat = max_abs_lat.max(lat.abs());
+    }
+    let cell_meters = 6_371_000.0 * CELL_DEG.to_radians();
+
+    // 3. Для адресов без города находим ближайший город по сетке
     let mut assigned = 0u64;
     let pb = crate::utils::progress_bar(objects.len() as u64, "Привязка к ближайшему городу");
     for obj in objects.iter_mut() {
@@ -379,15 +393,41 @@ pub fn infer_missing_cities(objects: &mut [GeoObject]) {
             GeoObject::Named(named) => (named.lat, named.lon, &mut named.city),
         };
         if city_ref.as_ref().map_or(true, |c| c.is_empty()) {
+            let qx = (lon / CELL_DEG).floor() as i64;
+            let qy = (lat / CELL_DEG).floor() as i64;
+            // Консервативная нижняя граница расстояния до следующего кольца:
+            // широтное смещение даёт CELL_DEG, долготное — CELL_DEG·cos(φ).
+            // Берём самый маленький cos среди городов и запроса.
+            let cos_bound = max_abs_lat.max(lat.abs()).to_radians().cos().max(1e-6);
+
             let mut best_city: Option<&str> = None;
             let mut best_dist = f64::MAX;
 
-            for &(city_name, city_lat, city_lon) in &centroids {
-                let dist = haversine_approx(lat, lon, city_lat, city_lon);
-                if dist < best_dist {
-                    best_dist = dist;
-                    best_city = Some(city_name);
+            let mut r: i64 = 0;
+            loop {
+                for cy in (qy - r)..=(qy + r) {
+                    for cx in (qx - r)..=(qx + r) {
+                        // только клетки границы текущего кольца
+                        if cx != qx - r && cx != qx + r && cy != qy - r && cy != qy + r {
+                            continue;
+                        }
+                        if let Some(cities) = grid.get(&(cx, cy)) {
+                            for &(name, clat, clon) in cities {
+                                let dist = haversine_approx(lat, lon, clat, clon);
+                                if dist < best_dist {
+                                    best_dist = dist;
+                                    best_city = Some(name);
+                                }
+                            }
+                        }
+                    }
                 }
+
+                // Дальше не найдём ничего ближе: следующее кольцо дальше `best_dist`.
+                if cell_meters * (r as f64) * cos_bound >= best_dist {
+                    break;
+                }
+                r += 1;
             }
 
             if let Some(city) = best_city {
