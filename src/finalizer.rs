@@ -5,7 +5,7 @@ use log::info;
 use std::io::Read;
 use std::path::Path;
 
-/// Сжать SQLite-файл алгоритмом Zstandard, вычислить SHA-256 и записать метаданные.
+/// Сжать файл базы алгоритмом Zstandard, вычислить SHA-256 и записать метаданные.
 ///
 /// Возвращает (размер сжатого файла, SHA-256, метаданные JSON).
 /// SHA-256 вычисляется из буфера в памяти, без повторного чтения файла.
@@ -35,9 +35,13 @@ pub fn compress_and_export_metadata(
     let compressed_size = compressed.len();
     let ratio = compressed_size as f64 / original_size as f64 * 100.0;
 
-    // Имя сжатого файла
+    // Имя сжатого файла: сохраняем расширение исходного файла (`.bin`).
     let stem = db_path.file_stem().unwrap().to_str().unwrap();
-    let compressed_path = output_dir.join(format!("{}.db.zst", stem));
+    let ext = db_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("bin");
+    let compressed_path = output_dir.join(format!("{}.{}.zst", stem, ext));
 
     std::fs::write(&compressed_path, &compressed)
         .context("Запись сжатого файла")?;

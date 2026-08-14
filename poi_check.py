@@ -4,10 +4,11 @@ from collections import Counter
 with open(sys.argv[1], 'rb') as f:
     d = f.read()
 
-sp_off = 88; n = struct.unpack_from('<I', d, sp_off)[0]
+sp_off = struct.unpack_from('<I', d, 72)[0]
+n = struct.unpack_from('<I', d, sp_off)[0]
 pool = []; pos = sp_off + 4
 for _ in range(n):
-    slen = struct.unpack_from('<H', d, pos)[0]; pos += 2
+    slen = struct.unpack_from('<I', d, pos)[0]; pos += 4
     pool.append(d[pos:pos+slen].decode('utf-8', errors='replace')); pos += slen
 
 ni_off = struct.unpack_from('<I', d, 76)[0]
@@ -16,7 +17,7 @@ cats = Counter()
 place_names = []
 pos = ni_off + 4
 for _ in range(ni_cnt):
-    name_idx = struct.unpack_from('<H', d, pos)[0]
+    name_idx = struct.unpack_from('<I', d, pos)[0]
     cat = struct.unpack_from('<B', d, pos+4)[0]
     name = pool[name_idx] if name_idx < len(pool) else ''
     cats[cat] += 1
@@ -39,17 +40,17 @@ ai_cnt = struct.unpack_from('<I', d, ai_off)[0]
 city_names = set()
 pos = ai_off + 4
 for _ in range(ai_cnt):
-    city_idx = struct.unpack_from('<H', d, pos)[0]
+    city_idx = struct.unpack_from('<I', d, pos)[0]
     city = pool[city_idx] if city_idx < len(pool) else ''
     if city:
         city_names.add(city)
-    pos += 10
+    pos += 16
 
 # Check named index for matches
 pos = ni_off + 4
 poi_cities = []
 for _ in range(ni_cnt):
-    name_idx = struct.unpack_from('<H', d, pos)[0]
+    name_idx = struct.unpack_from('<I', d, pos)[0]
     cat = struct.unpack_from('<B', d, pos+4)[0]
     name = pool[name_idx] if name_idx < len(pool) else ''
     if name in city_names:

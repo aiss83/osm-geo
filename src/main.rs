@@ -3,28 +3,26 @@
 //! Основные команды:
 //!   build   — сборка базы для региона
 //!   convert — конвертация OSM PBF в GeoDesk GOL
-//!   query   — тестовый поиск в собранной базе
-//!   info    — вывод метаданных о базе
 
 mod compact;
 mod corrector;
 mod dedup;
 mod downloader;
 mod finalizer;
+mod fts;
 mod gol;
 #[cfg(feature = "gol-ffi")]
 mod gol_ffi;
-mod indexer;
 mod model;
 mod normalizer;
 mod parser;
 mod source;
+mod stem;
 mod utils;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use log::info;
-use rusqlite::Connection;
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -58,11 +56,6 @@ enum Commands {
         #[arg(short, long)]
         region: Option<String>,
 
-        /// Формат вывода: sqlite (по умолчанию) или compact.
-        /// Можно указать несколько: -f sqlite -f compact
-        #[arg(short, long, default_value = "sqlite")]
-        format: Vec<String>,
-
         /// Источник данных: auto (по расширению), pbf или gol
         #[arg(long, default_value = "auto")]
         source: String,
@@ -81,23 +74,6 @@ enum Commands {
         /// Путь к исполняемому файлу `gol` (по умолчанию — из PATH/кэша)
         #[arg(long)]
         gol_bin: Option<PathBuf>,
-    },
-
-    /// Тестовый поиск в собранной базе
-    Query {
-        /// Путь к SQLite-базе
-        #[arg(short, long)]
-        db: PathBuf,
-
-        /// Поисковый запрос
-        query: String,
-    },
-
-    /// Вывод метаданных о собранной базе
-    Info {
-        /// Путь к SQLite-базе
-        #[arg(short, long)]
-        db: PathBuf,
     },
 
     /// Список доступных для скачивания регионов Geofabrik
@@ -130,26 +106,22 @@ fn main() -> Result<()> {
             input,
             output,
             region,
-            format,
             source,
-        } => cmd_build(&input, output.as_ref(), region.as_deref(), &format, &source),
+        } => cmd_build(&input, output.as_ref(), region.as_deref(), &source),
         Commands::Convert {
             input,
             output,
             gol_bin,
         } => cmd_convert(&input, output.as_ref(), gol_bin.as_ref()),
-        Commands::Query { db, query } => cmd_query(&db, &query),
-        Commands::Info { db } => cmd_info(&db),
         Commands::List { region } => cmd_list(region.as_deref()),
     }
 }
 
-/// Команда build: парсинг PBF → запись в SQLite или компактный бинарный формат.
+/// Команда build: парсинг PBF → запись в компактный бинарный формат.
 fn cmd_build(
     input: &str,
     output: Option<&PathBuf>,
     region: Option<&str>,
-    formats: &[String],
     source_kind: &str,
 ) -> Result<()> {
     info!("=== Сборка базы данных ===");
@@ -176,7 +148,6 @@ fn cmd_build(
         }
     };
     info!("Выходной файл (stem): {:?}", output_stem);
-    info!("Форматы: {:?}", formats);
 
     // 3. Парсинг источника (PBF или GOL)
     let corrector = corrector::Corrector::new_or_download()
@@ -246,69 +217,47 @@ fn cmd_build(
         count, addr_count, named_count
     );
 
-    // 6. Запись в каждом из запрошенных форматов
+    // 6. Запись компактного формата
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
 
-    for fmt in formats {
-        let ext = if fmt == "compact" { "bin" } else { "db" };
-        let output_path = output_stem.with_extension(ext);
-        info!("Запись в формате {}: {:?}", fmt, output_path);
+    let output_path = output_stem.with_extension("bin");
+    info!("Запись в компактном формате: {:?}", output_path);
 
-        let file_size = if fmt == "compact" {
-            let mut writer = compact::CompactWriter::new();
-            writer.build(&objects, &output_path, region.unwrap_or("unknown"), timestamp)?;
-            std::fs::metadata(&output_path)?.len()
-        } else {
-            let mut idx =
-                indexer::Indexer::create(&output_path)?.with_progress(count);
-            if let Some(region) = region {
-                idx.set_meta("region", region)?;
-            }
-            idx.set_meta("source", &input_path.display().to_string())?;
-            idx.set_meta("build_date", &crate::utils::today_iso())?;
-            idx.set_meta("version", env!("CARGO_PKG_VERSION"))?;
-            for chunk in objects.chunks(10_000) {
-                idx.insert_batch(chunk)?;
-            }
-            idx.set_meta("object_count", &count.to_string())?;
-            idx.set_meta("addr_count", &addr_count.to_string())?;
-            idx.set_meta("named_count", &named_count.to_string())?;
-            idx.finalize()?;
-            indexer::Indexer::db_size(&output_path)?
-        };
+    let mut writer = compact::CompactWriter::new();
+    writer.build(&objects, &output_path, region.unwrap_or("unknown"), timestamp)?;
+    let file_size = std::fs::metadata(&output_path)?.len();
 
-        info!(
-            "  Размер: {:.2} МБ",
-            file_size as f64 / (1024.0 * 1024.0)
-        );
+    info!(
+        "  Размер: {:.2} МБ",
+        file_size as f64 / (1024.0 * 1024.0)
+    );
 
-        // 7. Сжатие и метаданные
-        let output_dir = output_path.parent().unwrap_or(std::path::Path::new("."));
-        let mut metadata = finalizer::Metadata {
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            region: region.unwrap_or("unknown").to_string(),
-            build_date: crate::utils::today_iso(),
-            source_pbf: input_path.display().to_string(),
-            object_count: count,
-            address_count: addr_count as u64,
-            named_count: named_count as u64,
-            db_size_bytes: file_size,
-            compressed_size_bytes: None,
-            sha256: String::new(),
-        };
+    // 7. Сжатие и метаданные
+    let output_dir = output_path.parent().unwrap_or(std::path::Path::new("."));
+    let mut metadata = finalizer::Metadata {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        region: region.unwrap_or("unknown").to_string(),
+        build_date: crate::utils::today_iso(),
+        source_pbf: input_path.display().to_string(),
+        object_count: count,
+        address_count: addr_count as u64,
+        named_count: named_count as u64,
+        db_size_bytes: file_size,
+        compressed_size_bytes: None,
+        sha256: String::new(),
+    };
 
-        let (compressed_size, sha256, _meta_json) =
-            finalizer::compress_and_export_metadata(&output_path, output_dir, &mut metadata)?;
+    let (compressed_size, sha256, _meta_json) =
+        finalizer::compress_and_export_metadata(&output_path, output_dir, &mut metadata)?;
 
-        info!("  SHA-256: {}", sha256);
-        info!(
-            "  Сжатый размер: {:.2} МБ",
-            compressed_size as f64 / (1024.0 * 1024.0)
-        );
-    }
+    info!("  SHA-256: {}", sha256);
+    info!(
+        "  Сжатый размер: {:.2} МБ",
+        compressed_size as f64 / (1024.0 * 1024.0)
+    );
 
     info!("=== Сборка завершена ===");
     info!("Объектов: {}", count);
@@ -389,173 +338,6 @@ fn download_full_url(url: &str, dest: &PathBuf) -> Result<()> {
         file.write_all(&buf[..n])?;
     }
     info!("Загрузка завершена: {:?}", dest);
-    Ok(())
-}
-
-/// Команда query: тестовый поиск в базе.
-fn cmd_query(db: &PathBuf, query: &str) -> Result<()> {
-    use rusqlite::Connection;
-    use rust_stemmers::{Algorithm, Stemmer};
-
-    let conn = Connection::open(db)?;
-
-    // Применяем русский стеммер к запросу
-    let stemmer = Stemmer::create(Algorithm::Russian);
-    let stemmed: String = query
-        .split_whitespace()
-        .map(|w| {
-            let lower = w.to_lowercase();
-            format!("{}*", stemmer.stem(&lower))
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    println!("Запрос:        {}", query);
-    println!("Стемминг:      {}", stemmed);
-    println!();
-
-    // Поиск по адресам
-    println!("=== Адреса ===");
-    match search_fts(&conn, "fts_address", &stemmed) {
-        Ok(results) if !results.is_empty() => {
-            for (id, _) in results.iter().take(10) {
-                print_object(&conn, *id)?;
-            }
-        }
-        _ => println!("  (ничего не найдено)"),
-    }
-
-    // Поиск по именованным объектам
-    println!("\n=== Объекты ===");
-    match search_fts(&conn, "fts_named", &stemmed) {
-        Ok(results) if !results.is_empty() => {
-            for (id, _) in results.iter().take(10) {
-                print_object(&conn, *id)?;
-            }
-        }
-        _ => println!("  (ничего не найдено)"),
-    }
-
-    Ok(())
-}
-
-/// Поиск в FTS-таблице.
-fn search_fts(
-    conn: &Connection,
-    table: &str,
-    query: &str,
-) -> Result<Vec<(i64, f64)>> {
-    let sql = format!(
-        "SELECT rowid, rank FROM {} WHERE {} MATCH ?1 ORDER BY rank LIMIT 20",
-        table, table
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([query], |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
-    })?;
-
-    let mut results = Vec::new();
-    for row in rows {
-        results.push(row?);
-    }
-    Ok(results)
-}
-
-/// Вывести объект по id.
-fn print_object(conn: &Connection, id: i64) -> Result<()> {
-    let mut stmt =
-        conn.prepare("SELECT type, lat, lon,
-            country, city, street, housenumber, postcode,
-            name, category
-            FROM objects WHERE id = ?1")?;
-
-    let row = stmt.query_row([id], |row| {
-        Ok((
-            row.get::<_, u8>(0)?,
-            row.get::<_, f64>(1)?,
-            row.get::<_, f64>(2)?,
-            row.get::<_, Option<String>>(3)?,
-            row.get::<_, Option<String>>(4)?,
-            row.get::<_, Option<String>>(5)?,
-            row.get::<_, Option<String>>(6)?,
-            row.get::<_, Option<String>>(7)?,
-            row.get::<_, Option<String>>(8)?,
-            row.get::<_, Option<String>>(9)?,
-        ))
-    })?;
-
-    let (obj_type, lat, lon,
-        country, city, street, housenumber, _postcode,
-        name, category) = row;
-
-    match obj_type {
-        0 => {
-            let parts: Vec<&str> = [country.as_deref(), city.as_deref(),
-                street.as_deref(), housenumber.as_deref()]
-                .into_iter()
-                .flatten()
-                .collect();
-            println!("  [Адрес] [{}, {}] {}", lat, lon, parts.join(", "));
-        }
-        1 => {
-            println!("  [Объект] [{}, {}] {} ({})",
-                lat, lon,
-                name.as_deref().unwrap_or("?"),
-                category.as_deref().unwrap_or("без категории"));
-        }
-        _ => println!("  [?] id={}", id),
-    }
-
-    Ok(())
-}
-
-/// Команда info: вывод метаданных о базе.
-fn cmd_info(db: &PathBuf) -> Result<()> {
-    use rusqlite::Connection;
-
-    let conn = Connection::open(db)?;
-
-    println!("База данных: {:?}", db);
-
-    // Размер файла
-    let size = std::fs::metadata(db)?.len();
-    println!("Размер:       {:.2} МБ", size as f64 / (1024.0 * 1024.0));
-
-    // Метаданные
-    println!("\nМетаданные:");
-    let mut stmt = conn.prepare("SELECT key, value FROM meta ORDER BY key")?;
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
-
-    for row in rows {
-        let (key, value) = row?;
-        println!("  {}: {}", key, value);
-    }
-
-    // Статистика
-    println!("\nСтатистика:");
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM objects",
-        [],
-        |row| row.get(0),
-    )?;
-    println!("  Всего объектов: {}", count);
-
-    let addr_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM objects WHERE type = 0",
-        [],
-        |row| row.get(0),
-    )?;
-    println!("  Адресов:        {}", addr_count);
-
-    let named_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM objects WHERE type = 1",
-        [],
-        |row| row.get(0),
-    )?;
-    println!("  Объектов (POI): {}", named_count);
-
     Ok(())
 }
 

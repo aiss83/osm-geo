@@ -6,10 +6,11 @@ with open(sys.argv[1], 'rb') as f:
 target = sys.argv[2] if len(sys.argv) > 2 else 'Калининградский зоопарк'
 
 # Find in string pool
-sp_off = 88; n = struct.unpack_from('<I', d, sp_off)[0]
+sp_off = struct.unpack_from('<I', d, 72)[0]
+n = struct.unpack_from('<I', d, sp_off)[0]
 pool = []; pos = sp_off + 4; target_idx = None
 for i in range(n):
-    slen = struct.unpack_from('<H', d, pos)[0]; pos += 2
+    slen = struct.unpack_from('<I', d, pos)[0]; pos += 4
     s = d[pos:pos+slen].decode('utf-8', errors='replace')
     pool.append(s); pos += slen
     if s == target:
@@ -25,7 +26,7 @@ pos = ni_off + 4
 ni_cnt = struct.unpack_from('<I', d, ni_off)[0]
 rec_idx = None; cat = None
 for _ in range(ni_cnt):
-    name_idx = struct.unpack_from('<H', d, pos)[0]
+    name_idx = struct.unpack_from('<I', d, pos)[0]
     if name_idx == target_idx:
         cat = struct.unpack_from('<B', d, pos+4)[0]
         rec_idx = struct.unpack_from('<I', d, pos+5)[0]
@@ -44,9 +45,9 @@ for i in range(rec_cnt):
     obj_type = d[pos]; pos += 1
     lat, lon = struct.unpack_from('<ff', d, pos); pos += 8
     if obj_type == 0:  # Address
-        pos += 6  # city_idx(2) + street_idx(2) + hn_idx(2)
+        pos += 12  # city_idx(4) + street_idx(4) + hn_idx(4)
     elif obj_type == 1:  # Named
-        pos += 5  # name_idx(2) + translit_idx(2) + cat(1)
+        pos += 13  # country_idx(4) + city_idx(4) + name_idx(4) + cat(1)
     if i == rec_idx:
         break
 

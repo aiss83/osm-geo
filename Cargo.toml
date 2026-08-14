@@ -20,8 +20,6 @@ cc = "1"
 [dependencies]
 # PBF parsing
 osmpbf = "0.3"
-# SQLite with FTS5
-rusqlite = { version = "0.32", features = ["bundled", "vtab", "column_decltype"] }
 # CLI
 clap = { version = "4", features = ["derive"] }
 # JSON (metadata export)

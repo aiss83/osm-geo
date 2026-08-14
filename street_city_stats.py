@@ -6,10 +6,11 @@ path = sys.argv[1] if len(sys.argv) > 1 else '/tmp/test-kgd3.bin'
 with open(path, 'rb') as f:
     data = f.read()
 
-sp_off = 88; n = struct.unpack_from('<I', data, sp_off)[0]
+sp_off = struct.unpack_from('<I', data, 72)[0]
+n = struct.unpack_from('<I', data, sp_off)[0]
 pool = []; pos = sp_off + 4
 for _ in range(n):
-    slen = struct.unpack_from('<H', data, pos)[0]; pos += 2
+    slen = struct.unpack_from('<I', data, pos)[0]; pos += 4
     pool.append(data[pos:pos+slen].decode('utf-8', errors='replace')); pos += slen
 
 ai_off = struct.unpack_from('<I', data, 80)[0]
@@ -22,8 +23,8 @@ empty_city = 0
 
 pos = ai_off + 4
 for _ in range(ai_cnt):
-    city_idx = struct.unpack_from('<H', data, pos)[0]
-    street_idx = struct.unpack_from('<H', data, pos+2)[0]
+    city_idx = struct.unpack_from('<I', data, pos)[0]
+    street_idx = struct.unpack_from('<I', data, pos+4)[0]
     city = pool[city_idx] if city_idx < len(pool) else ''
     street = pool[street_idx] if street_idx < len(pool) else ''
     if not city:
@@ -31,7 +32,7 @@ for _ in range(ai_cnt):
     else:
         city_addr_count[city] += 1
         city_streets[city][street] += 1
-    pos += 10
+    pos += 16
 
 print(f"Всего адресов: {ai_cnt}")
 print(f"Без города: {empty_city}")

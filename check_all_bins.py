@@ -4,13 +4,13 @@ for path in sys.argv[1:]:
     with open(path, 'rb') as f:
         data = f.read()
     
-    sp_off = 88
+    sp_off = struct.unpack_from('<I', data, 72)[0]
     sp_count = struct.unpack_from('<I', data, sp_off)[0]
     pool = []
     pos = sp_off + 4
     for _ in range(sp_count):
-        slen = struct.unpack_from('<H', data, pos)[0]
-        pos += 2
+        slen = struct.unpack_from('<I', data, pos)[0]
+        pos += 4
         s = data[pos:pos+slen].decode('utf-8', errors='replace')
         pool.append(s)
         pos += slen

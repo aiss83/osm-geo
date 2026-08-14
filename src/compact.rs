@@ -5,25 +5,30 @@
 //! - Сортированных массивов для бинарного поиска
 //! - Отсутствия накладных расходов SQLite
 //!
-//! Формат файла:
+//! Формат файла (version 2):
 //!   [Header: 88B] — magic, version, counts, timestamp, region, offsets
+//!   [Section Directory] — id + offset + length для всех секций
 //!   [String Pool]
 //!   [Named Index]    — сортирован по name, для префиксного поиска
 //!   [Address Index]  — сортирован по (city, street, housenumber)
 //!   [Record Block]   — сортирован по (lat, lon), для пространственного поиска
+//!   [FTS Address tokens + postings]
+//!   [FTS Named tokens + postings]
 
 use anyhow::Result;
 use log::info;
 use std::collections::HashMap;
 use std::io::Write;
 
+use crate::fts::FtsIndex;
 use crate::model::GeoObject;
+use crate::stem::RussianStemmer;
 
 /// Заголовок файла (88 байт, little-endian).
 #[repr(C, packed)]
 struct Header {
     magic: [u8; 4],             // "OSMG"
-    version: u16,               // 1
+    version: u16,               // 2
     record_count: u32,
     addr_count: u32,
     named_count: u32,
@@ -33,6 +38,23 @@ struct Header {
     named_index_offset: u32,
     addr_index_offset: u32,
     records_offset: u32,
+}
+
+/// Идентификаторы секций в Section Directory.
+const SECTION_STRING_POOL: u16 = 1;
+const SECTION_NAMED_INDEX: u16 = 2;
+const SECTION_ADDR_INDEX: u16 = 3;
+const SECTION_RECORDS: u16 = 4;
+const SECTION_FTS_ADDR_TOKENS: u16 = 5;
+const SECTION_FTS_ADDR_POSTINGS: u16 = 6;
+const SECTION_FTS_NAMED_TOKENS: u16 = 7;
+const SECTION_FTS_NAMED_POSTINGS: u16 = 8;
+
+/// Запись в Section Directory: id + offset + length (10 байт).
+struct SectionEntry {
+    id: u16,
+    offset: u32,
+    length: u32,
 }
 
 /// Тег категории (1 байт).
@@ -72,11 +94,11 @@ fn category_to_tag(cat: Option<&str>) -> u8 {
     }
 }
 
-/// Словарь строк: собирает уникальные строки, назначает u16-индексы.
+/// Словарь строк: собирает уникальные строки, назначает u32-индексы.
 /// Индекс 0 зарезервирован для пустой строки.
 pub struct StringPool {
     strings: Vec<String>,
-    map: HashMap<String, u16>,
+    map: HashMap<String, u32>,
 }
 
 impl StringPool {
@@ -90,7 +112,7 @@ impl StringPool {
     }
 
     /// Добавить строку, вернуть индекс. Возвращает 0 для None/пустой.
-    pub fn intern(&mut self, s: Option<&str>) -> u16 {
+    pub fn intern(&mut self, s: Option<&str>) -> u32 {
         let s = s.unwrap_or("");
         if s.is_empty() {
             return 0;
@@ -98,7 +120,7 @@ impl StringPool {
         if let Some(&idx) = self.map.get(s) {
             return idx;
         }
-        let idx = self.strings.len() as u16;
+        let idx = self.strings.len() as u32;
         self.strings.push(s.to_string());
         self.map.insert(s.to_string(), idx);
         idx
@@ -113,7 +135,7 @@ impl StringPool {
         let count = self.strings.len() as u32;
         w.write_all(&count.to_le_bytes())?;
         for s in &self.strings {
-            let len = s.len() as u16;
+            let len = s.len() as u32;
             w.write_all(&len.to_le_bytes())?;
             w.write_all(s.as_bytes())?;
         }
@@ -122,7 +144,7 @@ impl StringPool {
 
     /// Размер сериализованного пула в байтах.
     pub fn serialized_size(&self) -> usize {
-        4 + self.strings.iter().map(|s| 2 + s.len()).sum::<usize>()
+        4 + self.strings.iter().map(|s| 4 + s.len()).sum::<usize>()
     }
 }
 
@@ -133,23 +155,23 @@ struct RecordEntry {
     lat: f32,
     lon: f32,
     /// Для Address: (city, street, housenumber)
-    addr_indices: Option<(u16, u16, u16)>,
+    addr_indices: Option<(u32, u32, u32)>,
     /// Для Named: (country, city, name, category)
-    named_data: Option<(u16, u16, u16, u8)>,
+    named_data: Option<(u32, u32, u32, u8)>,
 }
 
 /// Запись в Named Index (сортирована по имени).
 struct NamedIndexEntry {
-    name_idx: u16,
+    name_idx: u32,
     category: u8,
     record_idx: u32,
 }
 
 /// Запись в Address Index (сортирована по city+street+housenumber).
 struct AddrIndexEntry {
-    city_idx: u16,
-    street_idx: u16,
-    housenumber_idx: u16,
+    city_idx: u32,
+    street_idx: u32,
+    housenumber_idx: u32,
     record_idx: u32,
 }
 
@@ -281,20 +303,123 @@ impl CompactWriter {
 
         info!("Address Index: {} записей", self.addr_index.len());
 
-        // 5. Вычисляем offsets и пишем файл
-        let string_pool_offset = std::mem::size_of::<Header>() as u32;
-        let named_index_offset = string_pool_offset + self.pool.serialized_size() as u32;
-        let addr_index_offset =
-            named_index_offset + (4 + self.named_index.len() * 7) as u32; // count + entries (name_idx:2 + category:1 + record_idx:4 = 7)
-        let records_offset =
-            addr_index_offset + (4 + self.addr_index.len() * 10) as u32;
+        // 4b. Строим полнотекстовые индексы (адреса и именованные объекты).
+        // record_idx — индекс в уже отсортированном Record Block.
+        let stemmer = RussianStemmer::new();
+        let mut fts_addr = FtsIndex::new();
+        let mut fts_named = FtsIndex::new();
 
+        for (record_idx, rec) in self.records.iter().enumerate() {
+            let record_idx = record_idx as u32;
+            match rec.obj_type {
+                0 => {
+                    let (city_idx, street_idx, hn_idx) = rec.addr_indices.unwrap();
+                    let city = &self.pool.strings[city_idx as usize];
+                    let street = &self.pool.strings[street_idx as usize];
+                    let housenumber = &self.pool.strings[hn_idx as usize];
+                    for t in stemmer.stemmed_tokens(city) {
+                        fts_addr.add(t, record_idx);
+                    }
+                    for t in stemmer.stemmed_tokens(street) {
+                        fts_addr.add(t, record_idx);
+                    }
+                    for t in stemmer.raw_tokens(housenumber) {
+                        fts_addr.add(t, record_idx);
+                    }
+                }
+                1 => {
+                    let (_country_idx, city_idx, name_idx, _category) = rec.named_data.unwrap();
+                    let city = &self.pool.strings[city_idx as usize];
+                    let name = &self.pool.strings[name_idx as usize];
+                    for t in stemmer.stemmed_tokens(name) {
+                        fts_named.add(t, record_idx);
+                    }
+                    for t in stemmer.stemmed_tokens(city) {
+                        fts_named.add(t, record_idx);
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        info!(
+            "FTS: адреса — токенов {}, постингов {}; POI — токенов {}, постингов {}",
+            fts_addr.token_count(),
+            fts_addr.posting_count(),
+            fts_named.token_count(),
+            fts_named.posting_count()
+        );
+
+        let (fts_addr_tokens, fts_addr_postings) = fts_addr.serialize();
+        let (fts_named_tokens, fts_named_postings) = fts_named.serialize();
+
+        // 5. Вычисляем offsets и пишем файл.
         let addr_count = self
             .records
             .iter()
             .filter(|r| r.obj_type == 0)
             .count() as u32;
         let named_count = self.records.len() as u32 - addr_count;
+
+        let named_index_len = (4 + self.named_index.len() * 9) as u32;
+        let addr_index_len = (4 + self.addr_index.len() * 16) as u32;
+        let records_len =
+            (4 + addr_count as usize * 21 + named_count as usize * 22) as u32;
+
+        // Section Directory: 8 секций, каждая запись 10 байт + count u32.
+        let section_dir_len = (4 + 8 * 10) as u32;
+
+        let string_pool_offset = std::mem::size_of::<Header>() as u32 + section_dir_len;
+        let named_index_offset = string_pool_offset + self.pool.serialized_size() as u32;
+        let addr_index_offset = named_index_offset + named_index_len;
+        let records_offset = addr_index_offset + addr_index_len;
+        let fts_addr_tokens_offset = records_offset + records_len;
+        let fts_addr_postings_offset = fts_addr_tokens_offset + fts_addr_tokens.len() as u32;
+        let fts_named_tokens_offset = fts_addr_postings_offset + fts_addr_postings.len() as u32;
+        let fts_named_postings_offset = fts_named_tokens_offset + fts_named_tokens.len() as u32;
+
+        let sections = [
+            SectionEntry {
+                id: SECTION_STRING_POOL,
+                offset: string_pool_offset,
+                length: self.pool.serialized_size() as u32,
+            },
+            SectionEntry {
+                id: SECTION_NAMED_INDEX,
+                offset: named_index_offset,
+                length: named_index_len,
+            },
+            SectionEntry {
+                id: SECTION_ADDR_INDEX,
+                offset: addr_index_offset,
+                length: addr_index_len,
+            },
+            SectionEntry {
+                id: SECTION_RECORDS,
+                offset: records_offset,
+                length: records_len,
+            },
+            SectionEntry {
+                id: SECTION_FTS_ADDR_TOKENS,
+                offset: fts_addr_tokens_offset,
+                length: fts_addr_tokens.len() as u32,
+            },
+            SectionEntry {
+                id: SECTION_FTS_ADDR_POSTINGS,
+                offset: fts_addr_postings_offset,
+                length: fts_addr_postings.len() as u32,
+            },
+            SectionEntry {
+                id: SECTION_FTS_NAMED_TOKENS,
+                offset: fts_named_tokens_offset,
+                length: fts_named_tokens.len() as u32,
+            },
+            SectionEntry {
+                id: SECTION_FTS_NAMED_POSTINGS,
+                offset: fts_named_postings_offset,
+                length: fts_named_postings.len() as u32,
+            },
+        ];
 
         let mut region_bytes = [0u8; 46];
         let region_utf8 = region.as_bytes();
@@ -303,7 +428,7 @@ impl CompactWriter {
 
         let header = Header {
             magic: *b"OSMG",
-            version: 1,
+            version: 2,
             record_count: self.records.len() as u32,
             addr_count,
             named_count,
@@ -325,6 +450,14 @@ impl CompactWriter {
             )
         };
         file.write_all(header_bytes)?;
+
+        // Пишем Section Directory
+        file.write_all(&(sections.len() as u32).to_le_bytes())?;
+        for section in &sections {
+            file.write_all(&section.id.to_le_bytes())?;
+            file.write_all(&section.offset.to_le_bytes())?;
+            file.write_all(&section.length.to_le_bytes())?;
+        }
 
         // Пишем string pool
         self.pool.write_to(&mut file)?;
@@ -372,6 +505,12 @@ impl CompactWriter {
                 _ => unreachable!(),
             }
         }
+
+        // Пишем FTS-секции
+        file.write_all(&fts_addr_tokens)?;
+        file.write_all(&fts_addr_postings)?;
+        file.write_all(&fts_named_tokens)?;
+        file.write_all(&fts_named_postings)?;
 
         let size = file.metadata()?.len();
         info!(
@@ -515,15 +654,15 @@ mod tests {
         // Читаем файл обратно и проверяем строки в пуле
         let data = std::fs::read(&path).unwrap();
 
-        // Пропускаем header (88 байт)
-        let sp_off = 88;
+        // string_pool_offset лежит в заголовке по смещению 72 (см. Header).
+        let sp_off = u32::from_le_bytes(data[72..76].try_into().unwrap()) as usize;
         let sp_count = u32::from_le_bytes(data[sp_off..sp_off+4].try_into().unwrap()) as usize;
 
         let mut pool: Vec<String> = Vec::new();
         let mut pos = sp_off + 4;
         for _ in 0..sp_count {
-            let slen = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()) as usize;
-            pos += 2;
+            let slen = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+            pos += 4;
             let s = String::from_utf8(data[pos..pos+slen].to_vec()).unwrap();
             pool.push(s);
             pos += slen;
@@ -588,6 +727,131 @@ mod tests {
         let second = &writer.addr_index[1];
         let second_street = &writer.pool.strings[second.street_idx as usize];
         assert_eq!(second_street, "Я");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn read_varint(data: &[u8], pos: &mut usize) -> u32 {
+        let mut value = 0u32;
+        let mut shift = 0u32;
+        loop {
+            let byte = data[*pos];
+            *pos += 1;
+            value |= ((byte & 0x7f) as u32) << shift;
+            if byte & 0x80 == 0 {
+                return value;
+            }
+            shift += 7;
+        }
+    }
+
+    fn parse_section_directory(data: &[u8], offset: usize) -> Vec<(u16, usize, usize)> {
+        let count = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+        let mut sections = Vec::with_capacity(count);
+        let mut pos = offset + 4;
+        for _ in 0..count {
+            let id = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap());
+            pos += 2;
+            let off = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4;
+            let len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4;
+            sections.push((id, off, len));
+        }
+        sections
+    }
+
+    fn section_bytes<'a>(data: &'a [u8], sections: &[(u16, usize, usize)], id: u16) -> &'a [u8] {
+        let (_, off, len) = sections
+            .iter()
+            .copied()
+            .find(|(section_id, _, _)| *section_id == id)
+            .unwrap();
+        &data[off..off + len]
+    }
+
+    fn postings_for_token(tokens: &[u8], postings: &[u8], token: &str) -> Option<Vec<u32>> {
+        let count = u32::from_le_bytes(tokens[0..4].try_into().unwrap()) as usize;
+        let mut pos = 4usize;
+        for _ in 0..count {
+            let len = u16::from_le_bytes(tokens[pos..pos + 2].try_into().unwrap()) as usize;
+            pos += 2;
+            let current = &tokens[pos..pos + len];
+            pos += len;
+            let postings_offset =
+                u32::from_le_bytes(tokens[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4;
+            let postings_count =
+                u32::from_le_bytes(tokens[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4;
+
+            if current == token.as_bytes() {
+                let mut p = postings_offset;
+                let mut prev = 0u32;
+                let mut list = Vec::with_capacity(postings_count);
+                for _ in 0..postings_count {
+                    let rec = read_varint(postings, &mut p) + prev;
+                    prev = rec;
+                    list.push(rec);
+                }
+                return Some(list);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn test_compact_fts_sections() {
+        let objects = vec![
+            GeoObject::Address(Address {
+                country: None,
+                city: Some("Москва".into()),
+                street: Some("Тверская".into()),
+                housenumber: Some("1".into()),
+                postcode: None,
+                lat: 55.0,
+                lon: 37.0,
+            }),
+            GeoObject::Named(NamedObject {
+                name: "Красная площадь".into(),
+                country: None,
+                city: Some("Москва".into()),
+                category: Some("tourism".into()),
+                lat: 55.7539,
+                lon: 37.6208,
+            }),
+        ];
+
+        let path = std::path::PathBuf::from(std::env::temp_dir().join("test_compact_fts.bin"));
+        let mut writer = CompactWriter::new();
+        writer.build(&objects, &path, "RU-TEST", 0).unwrap();
+
+        let data = std::fs::read(&path).unwrap();
+
+        let version = u16::from_le_bytes(data[4..6].try_into().unwrap());
+        assert_eq!(version, 2);
+
+        let sections = parse_section_directory(&data, std::mem::size_of::<Header>());
+        assert_eq!(sections.len(), 8);
+
+        let fts_addr_tokens = section_bytes(&data, &sections, SECTION_FTS_ADDR_TOKENS);
+        let fts_addr_postings = section_bytes(&data, &sections, SECTION_FTS_ADDR_POSTINGS);
+        let fts_named_tokens = section_bytes(&data, &sections, SECTION_FTS_NAMED_TOKENS);
+        let fts_named_postings = section_bytes(&data, &sections, SECTION_FTS_NAMED_POSTINGS);
+
+        // Адрес отсортирован по lat 55.0 → record_idx 0, POI 55.7539 → record_idx 1.
+        assert_eq!(
+            postings_for_token(fts_addr_tokens, fts_addr_postings, "тверск"),
+            Some(vec![0])
+        );
+        assert_eq!(
+            postings_for_token(fts_named_tokens, fts_named_postings, "красн"),
+            Some(vec![1])
+        );
+        assert_eq!(
+            postings_for_token(fts_named_tokens, fts_named_postings, "площад"),
+            Some(vec![1])
+        );
 
         let _ = std::fs::remove_file(&path);
     }
