@@ -1614,6 +1614,7 @@ name = "osm-geo"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "cc",
  "clap",
  "env_logger",
  "flate2",

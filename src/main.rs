@@ -12,6 +12,8 @@ mod dedup;
 mod downloader;
 mod finalizer;
 mod gol;
+#[cfg(feature = "gol-ffi")]
+mod gol_ffi;
 mod indexer;
 mod model;
 mod normalizer;
@@ -193,6 +195,9 @@ fn cmd_build(
 
     let mut src: Box<dyn source::FeatureSource> = match kind {
         source::SourceKind::Pbf => Box::new(parser::PbfParser::new()),
+        #[cfg(feature = "gol-ffi")]
+        source::SourceKind::Gol => Box::new(gol_ffi::GolFfiSource::new()),
+        #[cfg(not(feature = "gol-ffi"))]
         source::SourceKind::Gol => Box::new(gol::GolSource::new()),
     };
     src.set_corrector(corrector);

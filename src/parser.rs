@@ -565,7 +565,7 @@ pub fn merge_typo_cities(objects: &mut [GeoObject]) {
 }
 
 /// Извлечь Address из тегов.
-fn extract_address(tags: &HashMap<String, String>, lat: f64, lon: f64, corrector: Option<&Corrector>, place_types: &HashMap<String, String>) -> Option<Address> {
+pub(crate) fn extract_address(tags: &HashMap<String, String>, lat: f64, lon: f64, corrector: Option<&Corrector>, place_types: &HashMap<String, String>) -> Option<Address> {
     let country = tags.get("addr:country").cloned();
     let city = correct_field(
         tags.get("addr:city")
@@ -604,7 +604,7 @@ fn extract_address(tags: &HashMap<String, String>, lat: f64, lon: f64, corrector
 }
 
 /// Определить русское описание типа населённого пункта по OSM-тегам.
-fn place_type_label(tags: &HashMap<String, String>) -> Option<String> {
+pub(crate) fn place_type_label(tags: &HashMap<String, String>) -> Option<String> {
     if let Some(place) = tags.get("place") {
         match place.as_str() {
             "allotments" => return Some("СНТ".into()),
@@ -653,7 +653,7 @@ fn correct_field(value: Option<String>, corrector: Option<&Corrector>) -> Option
 ///
 /// Всё остальное (магазины, транспорт, дороги, досуг, офисы, природные объекты и т.д.)
 /// в Named-индекс не включается.
-fn extract_named_object(tags: &HashMap<String, String>, lat: f64, lon: f64, corrector: Option<&Corrector>) -> Option<NamedObject> {
+pub(crate) fn extract_named_object(tags: &HashMap<String, String>, lat: f64, lon: f64, corrector: Option<&Corrector>) -> Option<NamedObject> {
     // Требуем ровно одну из допустимых категорий — иначе это не целевой POI.
     let (category_key, _category_value) = if let Some(v) = tags.get("historic") {
         ("historic", v)

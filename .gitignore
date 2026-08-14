@@ -28,3 +28,6 @@ dist/
 
 # GeoDesk GOL (build artifacts)
 *.gol
+
+# Vendored third-party C++ sources (libgeodesk, gtl)
+vendor/

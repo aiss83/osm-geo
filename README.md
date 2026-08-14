@@ -104,6 +104,7 @@ models/
 | *(без флагов)* | Rule-based нормализатор (по умолчанию) | Нет |
 | `neural-normalizer` | ONNX Runtime для нейросети | `libonnxruntime` |
 | `neural-tokenizer` | SentencePiece токенизация (pure Rust) | Нет |
+| `gol-ffi` | Прямое чтение GOL без подпроцесса и промежуточного PBF | clang++/g++ (C++20), libgeodesk + gtl |
 
 Пример: `cargo build --release --features neural-normalizer,neural-tokenizer`
 
@@ -192,6 +193,32 @@ osm-geo build --input region.gol --source gol
 # Или автоматически — по расширению .gol
 osm-geo build --input region.gol
 ```
+
+### Прямое чтение GOL через FFI (без промежуточного PBF)
+
+При сборке с флагом `gol-ffi` источник GOL читается напрямую через C ABI
+поверх C++-библиотеки libgeodesk — без подпроцесса `gol` и без конвертации в PBF.
+
+```bash
+cargo build --release --features gol-ffi
+```
+
+Требования и подготовка:
+
+```bash
+# исходники libgeodesk и заголовки gtl (не входят в репозиторий)
+git clone https://github.com/clarisma/libgeodesk.git vendor/libgeodesk
+git clone https://github.com/greg7mdp/gtl.git vendor/gtl
+```
+
+Либо задайте переменные окружения `LIBGEODESK_DIR` и `GTL_DIR`. Сборка C++-части
+выполняется автоматически в `build.rs`.
+
+При включённом `gol-ffi` путь `--source gol` использует FFI; без флага —
+CLI `gol query`. Результат извлечения совпадает с PBF-путём на уровне сырых
+объектов; расхождение возможно только в координатах (центроид libgeodesk
+геометрический, а не среднее арифметическое нод), что может чуть менять
+дедупликацию и привязку городов.
 
 ### Известные ограничения
 
