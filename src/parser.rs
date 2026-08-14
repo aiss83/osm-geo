@@ -604,17 +604,33 @@ pub fn merge_typo_cities(objects: &mut [GeoObject]) {
     );
 }
 
+/// Разбить значение тега по `,`/`;` и взять первый непустой фрагмент.
+///
+/// В OSM `addr:street` (и иногда `addr:city`) часто содержит несколько значений
+/// через запятую: «улица А, улица Б», «улица, дом 12/1». Берём первое значение,
+/// чтобы в базе не появлялись «склеенные» улицы.
+fn split_first(value: Option<String>) -> Option<String> {
+    value.and_then(|v| {
+        v.split([',', ';'])
+            .map(str::trim)
+            .find(|p| !p.is_empty())
+            .map(str::to_string)
+    })
+}
+
 /// Извлечь Address из тегов.
 pub(crate) fn extract_address(tags: &HashMap<String, String>, lat: f64, lon: f64, corrector: Option<&Corrector>, place_types: &HashMap<String, String>) -> Option<Address> {
     let country = tags.get("addr:country").cloned();
     let city = correct_field(
-        tags.get("addr:city")
-            .or_else(|| tags.get("addr:town"))
-            .or_else(|| tags.get("addr:place"))
-            .cloned(),
+        split_first(
+            tags.get("addr:city")
+                .or_else(|| tags.get("addr:town"))
+                .or_else(|| tags.get("addr:place"))
+                .cloned(),
+        ),
         corrector,
     );
-    let mut street = correct_field(tags.get("addr:street").cloned(), corrector);
+    let mut street = correct_field(split_first(tags.get("addr:street").cloned()), corrector);
     let housenumber = tags.get("addr:housenumber").cloned();
     let postcode = tags.get("addr:postcode").cloned();
 
@@ -747,6 +763,36 @@ mod tests {
         let mut tags = HashMap::new();
         tags.insert("addr:housenumber".to_string(), "1".to_string());
         assert!(extract_address(&tags, 0.0, 0.0, None, &HashMap::new()).is_none());
+    }
+
+    #[test]
+    fn test_extract_address_splits_comma_street() {
+        let mut tags = HashMap::new();
+        tags.insert(
+            "addr:street".to_string(),
+            "улица 1-й Ударной Армии, улица Ленина".to_string(),
+        );
+        tags.insert("addr:housenumber".to_string(), "3".to_string());
+        let addr = extract_address(&tags, 0.0, 0.0, None, &HashMap::new()).unwrap();
+        assert_eq!(addr.street.unwrap(), "улица 1-й Ударной Армии");
+    }
+
+    #[test]
+    fn test_split_first() {
+        assert_eq!(
+            split_first(Some("улица А, улица Б".into())),
+            Some("улица А".into())
+        );
+        assert_eq!(
+            split_first(Some("улица А;улица Б".into())),
+            Some("улица А".into())
+        );
+        assert_eq!(
+            split_first(Some("  ,  улица А , ".into())),
+            Some("улица А".into())
+        );
+        assert_eq!(split_first(Some("".into())), None);
+        assert_eq!(split_first(None), None);
     }
 
     #[test]
