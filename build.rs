@@ -2,11 +2,13 @@
 //
 // Требования (при включённом флаге):
 //   - компилятор C++20 (clang++ или g++),
-//   - исходники libgeodesk и заголовки gtl, доступные по:
-//     * env LIBGEODESK_DIR / GTL_DIR, либо
-//     * каталоги vendor/libgeodesk и vendor/gtl.
+//   - исходники libgeodesk и заголовки gtl. Поиск по приоритету:
+//       1. переменные окружения LIBGEODESK_DIR / GTL_DIR,
+//       2. каталоги vendor/libgeodesk и vendor/gtl,
+//       3. автоматическое клонирование в vendor/ (нужен git и сеть).
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=gol-ffi/gol_ffi.cpp");
@@ -29,18 +31,59 @@ fn locate_deps() -> (PathBuf, PathBuf) {
     }
 
     let vendor = Path::new("vendor");
-    let g = vendor.join("libgeodesk");
-    let t = vendor.join("gtl");
-    if g.join("include").exists() && g.join("src").exists() && t.join("include").exists() {
-        return (g, t);
+    let libgeodesk = vendor.join("libgeodesk");
+    let gtl = vendor.join("gtl");
+
+    ensure_cloned(
+        "https://github.com/clarisma/libgeodesk.git",
+        None,
+        &libgeodesk,
+        |d| d.join("include").exists() && d.join("src").exists(),
+    );
+    ensure_cloned(
+        "https://github.com/greg7mdp/gtl.git",
+        Some("v1.2.0"),
+        &gtl,
+        |d| d.join("include").exists(),
+    );
+
+    (libgeodesk, gtl)
+}
+
+/// Склонировать репозиторий в `dest`, если он ещё не готов к использованию.
+fn ensure_cloned<F: Fn(&Path) -> bool>(
+    url: &str,
+    branch: Option<&str>,
+    dest: &Path,
+    is_ready: F,
+) {
+    if is_ready(dest) {
+        return;
     }
 
-    panic!(
-        "feature `gol-ffi` требует исходники libgeodesk и gtl.\n\
-         Задайте переменные LIBGEODESK_DIR и GTL_DIR, либо склонируйте их:\n\
-         \x20 git clone https://github.com/clarisma/libgeodesk.git vendor/libgeodesk\n\
-         \x20 git clone https://github.com/greg7mdp/gtl.git vendor/gtl"
+    println!(
+        "cargo:warning=gol-ffi: клонирование {} в {} ...",
+        url,
+        dest.display()
     );
+
+    let mut cmd = Command::new("git");
+    cmd.args(["clone", "--depth", "1"]);
+    if let Some(b) = branch {
+        cmd.args(["--branch", b]);
+    }
+    cmd.arg(url).arg(dest);
+    let ok = cmd.status().map(|s| s.success()).unwrap_or(false);
+
+    if !ok || !is_ready(dest) {
+        panic!(
+            "feature `gol-ffi` требует исходники libgeodesk и gtl, \
+             но их не удалось клонировать автоматически (нужны git и сеть).\n\
+             Клонируйте вручную:\n\
+             \x20 git clone https://github.com/clarisma/libgeodesk.git vendor/libgeodesk\n\
+             \x20 git clone --branch v1.2.0 https://github.com/greg7mdp/gtl.git vendor/gtl"
+        );
+    }
 }
 
 fn build(libgeodesk: &Path, gtl: &Path) {

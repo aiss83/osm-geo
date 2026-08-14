@@ -205,14 +205,17 @@ cargo build --release --features gol-ffi
 
 Требования и подготовка:
 
+- компилятор C++20 (clang++ или g++);
+- исходники libgeodesk и заголовки gtl — при первом включении флага `build.rs`
+  клонирует их в `vendor/` автоматически (нужны git и сеть). Либо вручную:
+
 ```bash
-# исходники libgeodesk и заголовки gtl (не входят в репозиторий)
 git clone https://github.com/clarisma/libgeodesk.git vendor/libgeodesk
-git clone https://github.com/greg7mdp/gtl.git vendor/gtl
+git clone --branch v1.2.0 https://github.com/greg7mdp/gtl.git vendor/gtl
 ```
 
-Либо задайте переменные окружения `LIBGEODESK_DIR` и `GTL_DIR`. Сборка C++-части
-выполняется автоматически в `build.rs`.
+- альтернатива клонированию — переменные окружения `LIBGEODESK_DIR` и `GTL_DIR`.
+Сборка C++-части выполняется автоматически в `build.rs`.
 
 При включённом `gol-ffi` путь `--source gol` использует FFI; без флага —
 CLI `gol query`. Результат извлечения совпадает с PBF-путём на уровне сырых
