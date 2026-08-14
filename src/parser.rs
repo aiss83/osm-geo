@@ -605,10 +605,6 @@ pub fn merge_typo_cities(objects: &mut [GeoObject]) {
 }
 
 /// Разбить значение тега по `,`/`;` и взять первый непустой фрагмент.
-///
-/// В OSM `addr:street` (и иногда `addr:city`) часто содержит несколько значений
-/// через запятую: «улица А, улица Б», «улица, дом 12/1». Берём первое значение,
-/// чтобы в базе не появлялись «склеенные» улицы.
 fn split_first(value: Option<String>) -> Option<String> {
     value.and_then(|v| {
         v.split([',', ';'])
@@ -616,6 +612,48 @@ fn split_first(value: Option<String>) -> Option<String> {
             .find(|p| !p.is_empty())
             .map(str::to_string)
     })
+}
+
+/// Ключевые слова типов улиц (с распространёнными падежами и сокращениями).
+const STREET_TYPE_HINTS: &[&str] = &[
+    "улица", "улицы", "улице", "улицу", "улицей",
+    "проспект", "проспекта", "проспекту", "проспектом",
+    "переулок", "переулка", "переулку", "переулком",
+    "проезд", "проезда", "проезду", "проездом",
+    "шоссе", "набережная", "набережной",
+    "бульвар", "бульвара", "бульвару", "бульваром",
+    "аллея", "аллеи", "площадь", "площади",
+    "тупик", "тупика", "линия", "линии",
+    "просек", "тракт", "дорога", "дороги",
+    "микрорайон", "квартал",
+    "ул", "пр-т", "пр-кт", "просп", "пер", "пр-д", "наб", "бул", "б-р", "пл", "ш",
+];
+
+/// Похож ли фрагмент на улицу (содержит слово-тип улицы).
+fn looks_like_street(part: &str) -> bool {
+    part.split_whitespace().any(|w| {
+        let w = w
+            .trim_matches(|c: char| !c.is_alphanumeric() && c != '-')
+            .to_lowercase();
+        STREET_TYPE_HINTS.contains(&w.as_str())
+    })
+}
+
+/// Умное разбиение `addr:street`: из частей через `,`/`;` выбираем ту, что похожа
+/// на улицу; если такой нет — первую непустую. Не позволяет в базе появиться
+/// «склеенным» улицам и не подменяет улицу названием региона/города.
+fn split_street(value: Option<String>) -> Option<String> {
+    let value = value?;
+    let parts: Vec<&str> = value
+        .split([',', ';'])
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect();
+
+    if let Some(street) = parts.iter().copied().find(|p| looks_like_street(p)) {
+        return Some(street.to_string());
+    }
+    parts.first().map(|s| s.to_string())
 }
 
 /// Извлечь Address из тегов.
@@ -630,7 +668,7 @@ pub(crate) fn extract_address(tags: &HashMap<String, String>, lat: f64, lon: f64
         ),
         corrector,
     );
-    let mut street = correct_field(split_first(tags.get("addr:street").cloned()), corrector);
+    let mut street = correct_field(split_street(tags.get("addr:street").cloned()), corrector);
     let housenumber = tags.get("addr:housenumber").cloned();
     let postcode = tags.get("addr:postcode").cloned();
 
@@ -793,6 +831,27 @@ mod tests {
         );
         assert_eq!(split_first(Some("".into())), None);
         assert_eq!(split_first(None), None);
+    }
+
+    #[test]
+    fn test_split_street_picks_street_part() {
+        assert_eq!(
+            split_street(Some("Московская область, Наро-Фоминск, улица Ленина, 8".into())),
+            Some("улица Ленина".into())
+        );
+        assert_eq!(
+            split_street(Some("улица 1-й Ударной Армии, дом 12/1".into())),
+            Some("улица 1-й Ударной Армии".into())
+        );
+        assert_eq!(
+            split_street(Some("Ленинградское шоссе, 88-й километр".into())),
+            Some("Ленинградское шоссе".into())
+        );
+        // нет улицы — берём первый непустой фрагмент
+        assert_eq!(
+            split_street(Some("Московская область, Наро-Фоминск".into())),
+            Some("Московская область".into())
+        );
     }
 
     #[test]
