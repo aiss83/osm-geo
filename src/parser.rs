@@ -629,19 +629,31 @@ const STREET_TYPE_HINTS: &[&str] = &[
     "ул", "пр-т", "пр-кт", "просп", "пер", "пр-д", "наб", "бул", "б-р", "пл", "ш",
 ];
 
-/// Похож ли фрагмент на улицу (содержит слово-тип улицы).
+/// Похож ли фрагмент на улицу: содержит слово-тип улицы И название
+/// (не только сам тип — голое «улица» улицей не считаем).
 fn looks_like_street(part: &str) -> bool {
-    part.split_whitespace().any(|w| {
-        let w = w
-            .trim_matches(|c: char| !c.is_alphanumeric() && c != '-')
-            .to_lowercase();
-        STREET_TYPE_HINTS.contains(&w.as_str())
-    })
+    let words: Vec<String> = part
+        .split_whitespace()
+        .map(|w| {
+            w.trim_matches(|c: char| !c.is_alphanumeric() && c != '-')
+                .to_lowercase()
+        })
+        .collect();
+    let has_type = words
+        .iter()
+        .any(|w| STREET_TYPE_HINTS.contains(&w.as_str()));
+    let has_name = words
+        .iter()
+        .any(|w| !STREET_TYPE_HINTS.contains(&w.as_str()));
+    has_type && has_name
 }
 
-/// Умное разбиение `addr:street`: из частей через `,`/`;` выбираем ту, что похожа
-/// на улицу; если такой нет — первую непустую. Не позволяет в базе появиться
-/// «склеенным» улицам и не подменяет улицу названием региона/города.
+/// Умное разбиение `addr:street`.
+///
+/// - Одна часть — возвращаем её как есть.
+/// - Несколько частей — ищем ту, что похожа на улицу.
+/// - Улицы нет (только регион/населённый пункт/номер дома) — возвращаем `None`,
+///   чтобы такой адрес не попал в базу с «улицей» из административного объекта.
 fn split_street(value: Option<String>) -> Option<String> {
     let value = value?;
     let parts: Vec<&str> = value
@@ -650,10 +662,15 @@ fn split_street(value: Option<String>) -> Option<String> {
         .filter(|p| !p.is_empty())
         .collect();
 
-    if let Some(street) = parts.iter().copied().find(|p| looks_like_street(p)) {
-        return Some(street.to_string());
+    match parts.as_slice() {
+        [] => None,
+        [single] => Some((*single).to_string()),
+        _ => parts
+            .iter()
+            .copied()
+            .find(|p| looks_like_street(p))
+            .map(str::to_string),
     }
-    parts.first().map(|s| s.to_string())
 }
 
 /// Извлечь Address из тегов.
@@ -668,12 +685,15 @@ pub(crate) fn extract_address(tags: &HashMap<String, String>, lat: f64, lon: f64
         ),
         corrector,
     );
-    let mut street = correct_field(split_street(tags.get("addr:street").cloned()), corrector);
+    let street_tag = tags.get("addr:street").cloned();
+    let mut street = correct_field(split_street(street_tag.clone()), corrector);
     let housenumber = tags.get("addr:housenumber").cloned();
     let postcode = tags.get("addr:postcode").cloned();
 
-    // Если улицы нет, пробуем подставить тип населённого пункта
-    if street.is_none() {
+    // Тега улицы нет вовсе — пробуем подставить тип населённого пункта.
+    // Если же улица указана, но в ней нет части-улицы (только регион/населённый
+    // пункт), адрес не используем.
+    if street.is_none() && street_tag.is_none() {
         if let Some(ref city_name) = city {
             if let Some(place_desc) = place_types.get(city_name) {
                 street = Some(format!("{} {}", place_desc, city_name));
@@ -816,6 +836,34 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_address_drops_region_settlement_street() {
+        // Регион + населённый пункт без улицы — адрес не используем, даже если
+        // город известен и для него есть тип населённого пункта.
+        let mut tags = HashMap::new();
+        tags.insert(
+            "addr:street".to_string(),
+            "Московская область, Наро-Фоминск".to_string(),
+        );
+        tags.insert("addr:city".to_string(), "Наро-Фоминск".to_string());
+        tags.insert("addr:housenumber".to_string(), "1".to_string());
+        let mut place_types = HashMap::new();
+        place_types.insert("Наро-Фоминск".to_string(), "город".to_string());
+        assert!(extract_address(&tags, 0.0, 0.0, None, &place_types).is_none());
+    }
+
+    #[test]
+    fn test_extract_address_no_street_uses_place_type() {
+        // Тега улицы нет вовсе — подставляем тип населённого пункта.
+        let mut tags = HashMap::new();
+        tags.insert("addr:place".to_string(), "Наро-Фоминск".to_string());
+        tags.insert("addr:housenumber".to_string(), "1".to_string());
+        let mut place_types = HashMap::new();
+        place_types.insert("Наро-Фоминск".to_string(), "город".to_string());
+        let addr = extract_address(&tags, 0.0, 0.0, None, &place_types).unwrap();
+        assert_eq!(addr.street.unwrap(), "город Наро-Фоминск");
+    }
+
+    #[test]
     fn test_split_first() {
         assert_eq!(
             split_first(Some("улица А, улица Б".into())),
@@ -847,10 +895,20 @@ mod tests {
             split_street(Some("Ленинградское шоссе, 88-й километр".into())),
             Some("Ленинградское шоссе".into())
         );
-        // нет улицы — берём первый непустой фрагмент
+        // одна часть — возвращаем как есть (название без слова-типа — норма)
+        assert_eq!(
+            split_street(Some("Тверская".into())),
+            Some("Тверская".into())
+        );
+        // нет улицы (регион + населённый пункт) — не используем как улицу
         assert_eq!(
             split_street(Some("Московская область, Наро-Фоминск".into())),
-            Some("Московская область".into())
+            None
+        );
+        // голое «улица» после запятой — не считаем улицей
+        assert_eq!(
+            split_street(Some("17-я Лесная, улица".into())),
+            None
         );
     }
 
