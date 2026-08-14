@@ -31,6 +31,7 @@ unsafe extern "C" {
     fn gol_open(path: *const c_char) -> *mut GolFeatures;
     fn gol_close(f: *mut GolFeatures);
     fn gol_iterate(f: *const GolFeatures) -> *mut GolFeature;
+    fn gol_count(f: *const GolFeatures) -> u64;
     fn gol_next(it: *mut GolFeature) -> i32;
     fn gol_free(it: *mut GolFeature);
     fn gol_type(it: *const GolFeature) -> i32;
@@ -74,6 +75,8 @@ fn read_tags(it: *mut GolFeature, keys: &[CString]) -> HashMap<String, String> {
 /// Пройтись по всем фичам коллекции, вызывая `f(type, lat, lon, tags)`.
 fn for_each_feature(
     lib: *const GolFeatures,
+    total: u64,
+    label: &str,
     mut f: impl FnMut(i32, f64, f64, HashMap<String, String>),
 ) -> Result<()> {
     let it = unsafe { gol_iterate(lib) };
@@ -81,6 +84,7 @@ fn for_each_feature(
         bail!("gol_iterate: не удалось создать итератор");
     }
 
+    let pb = crate::utils::progress_bar(total, label);
     let keys: Vec<CString> = TAG_KEYS
         .iter()
         .map(|k| CString::new(*k).expect("тег без NUL"))
@@ -96,8 +100,10 @@ fn for_each_feature(
         let lat = unsafe { gol_lat(it) };
         let tags = read_tags(it, &keys);
         f(feature_type, lat, lon, tags);
+        pb.inc(1);
     }
 
+    pb.finish_and_clear();
     unsafe { gol_free(it) };
     Ok(())
 }
@@ -113,9 +119,12 @@ impl GolFfiSource {
     }
 
     fn parse_opened(&self, lib: *const GolFeatures) -> Result<Vec<GeoObject>> {
+        // Общее число фич — для точных прогресс-баров (один лишний проход).
+        let total = unsafe { gol_count(lib) };
+
         // Проход 1: собираем типы мест (название → «город»/«деревня»/«СНТ»/…).
         let mut place_types: HashMap<String, String> = HashMap::new();
-        for_each_feature(lib, |_, _, _, tags| {
+        for_each_feature(lib, total, "Сбор типов мест из GOL", |_, _, _, tags| {
             if let Some(place_name) = tags.get("name").or_else(|| tags.get("name:ru")) {
                 if let Some(pt) = place_type_label(&tags) {
                     place_types.entry(place_name.clone()).or_insert(pt);
@@ -125,7 +134,7 @@ impl GolFfiSource {
 
         // Проход 2: извлекаем адреса и POI.
         let mut objects = Vec::new();
-        for_each_feature(lib, |feature_type, lat, lon, tags| {
+        for_each_feature(lib, total, "Извлечение объектов из GOL", |feature_type, lat, lon, tags| {
             if feature_type == FEATURE_RELATION {
                 // В текущем PBF-парсере relations дают только named-объекты.
                 if let Some(obj) = extract_named_object(&tags, lat, lon, self.corrector.as_ref()) {
@@ -154,7 +163,10 @@ impl GolFfiSource {
 
         let addr_count = objects.iter().filter(|o| o.as_address().is_some()).count();
         let named_count = objects.iter().filter(|o| o.as_named().is_some()).count();
-        info!("GOL(FFI) сырых: адресов={}, POI={}", addr_count, named_count);
+        info!(
+            "GOL(FFI): {} фич, сырых: адресов={}, POI={}",
+            total, addr_count, named_count
+        );
 
         Ok(objects)
     }

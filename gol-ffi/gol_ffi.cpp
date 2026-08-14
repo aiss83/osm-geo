@@ -82,6 +82,10 @@ GolFeature* gol_iterate(const GolFeatures* f) {
     }
 }
 
+uint64_t gol_count(const GolFeatures* f) {
+    return f->features.count();
+}
+
 int gol_next(GolFeature* it) {
     return it->next() ? 1 : 0;
 }

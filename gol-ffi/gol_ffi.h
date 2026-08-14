@@ -24,6 +24,9 @@ GolFeatures* gol_query(const GolFeatures* f, const char* query);
 /* Create an iterator over a collection. Returns NULL on error. */
 GolFeature* gol_iterate(const GolFeatures* f);
 
+/* Number of features in the collection. */
+uint64_t gol_count(const GolFeatures* f);
+
 /* Advance to the next feature. Returns 1 if a feature is available, 0 at end. */
 int gol_next(GolFeature* it);
 
