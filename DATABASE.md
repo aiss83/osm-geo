@@ -65,6 +65,36 @@
 
 Все многобайтовые поля — little-endian.
 
+Графически файл выглядит так (сверху вниз):
+
+```text
+Смещение 0
+┌───────────────────────────────┐
+│ Header (88 B)                 │
+├───────────────────────────────┤ 88
+│ Section Directory (84 B)      │
+├───────────────────────────────┤ string_pool_offset
+│ String Pool                   │
+├───────────────────────────────┤ named_index_offset
+│ Named Index                   │
+├───────────────────────────────┤ addr_index_offset
+│ Address Index                 │
+├───────────────────────────────┤ records_offset
+│ Record Block                  │
+├───────────────────────────────┤ id 5 (offset/length в Section Directory)
+│ FTS Address token dictionary  │
+├───────────────────────────────┤ id 6
+│ FTS Address postings          │
+├───────────────────────────────┤ id 7
+│ FTS Named token dictionary    │
+├───────────────────────────────┤ id 8
+│ FTS Named postings            │
+└───────────────────────────────┘
+```
+
+Смещения первых четырёх секций продублированы в заголовке; FTS-секции
+находятся только по Section Directory (id 5–8).
+
 ### 2.1. Заголовок (Header, 88 байт)
 
 | Смещение | Размер | Поле | Описание |
