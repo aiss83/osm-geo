@@ -12,12 +12,15 @@ use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
 use log::info;
 use osmpbf::{Element, ElementReader};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use crate::model::{Address, GeoObject, NamedObject};
+use crate::model::{Address, Country, CountryBoundary, GeoObject, NamedObject};
 use crate::corrector::Corrector;
 use crate::utils::{levenshtein_distance, haversine_approx};
+
+/// Пространственная сетка городов: клетка → список (название, lat, lon).
+type CityGrid<'a> = HashMap<(i64, i64), Vec<(&'a str, f64, f64)>>;
 
 /// Парсер PBF-файлов OSM.
 pub struct PbfParser {
@@ -34,6 +37,14 @@ pub struct PbfParser {
     corrector: Option<Corrector>,
     /// Типы населённых пунктов: название → описание (СНТ, посёлок, ...)
     place_types: HashMap<String, String>,
+    /// Страна, определённая по `admin_level=2` relation (если найдена).
+    admin_country: Option<Country>,
+    /// Итоговая страна (по `addr:country` большинству или admin_country).
+    detected_country: Option<Country>,
+    /// Счётчик значений `addr:country` для fallback-определения страны.
+    addr_country_counts: HashMap<String, u64>,
+    /// Граница страны (MultiPolygon), извлечённая из `admin_level=2` relation.
+    boundary: Option<CountryBoundary>,
 }
 
 impl PbfParser {
@@ -48,6 +59,10 @@ impl PbfParser {
             way_coords: HashMap::new(),
             corrector: None,
             place_types: HashMap::new(),
+            admin_country: None,
+            detected_country: None,
+            addr_country_counts: HashMap::new(),
+            boundary: None,
         }
     }
 
@@ -76,13 +91,12 @@ impl PbfParser {
                 Element::Way(w) => w.tags().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
                 Element::Relation(r) => r.tags().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
             };
-            if let Some(place_name) = tags.get("name").or_else(|| tags.get("name:ru")) {
-                if let Some(place_type) = place_type_label(&tags) {
+            if let Some(place_name) = tags.get("name").or_else(|| tags.get("name:ru"))
+                && let Some(place_type) = place_type_label(&tags) {
                     self.place_types
                         .entry(place_name.to_string())
                         .or_insert(place_type);
                 }
-            }
             pb.inc(1);
         })?;
 
@@ -166,6 +180,24 @@ impl PbfParser {
 
         pb.finish_with_message(format!("Извлечено {} объектов", objects.len()));
 
+        // Страна: сначала большинство `addr:country`, затем admin_level=2 ISO.
+        let majority = {
+            let mut best: Option<(u64, String)> = None;
+            for (val, count) in &self.addr_country_counts {
+                let code = val.trim().to_ascii_uppercase();
+                if code.len() == 2 && code.chars().all(|c| c.is_ascii_uppercase())
+                    && best.as_ref().map_or(true, |(bc, _)| *count > *bc) {
+                        best = Some((*count, code));
+                    }
+            }
+            best.map(|(_, code)| code)
+        };
+        self.detected_country = majority
+            .and_then(|code| crate::country::from_code(&code))
+            .or_else(|| self.admin_country.take());
+
+        self.extract_boundary(path)?;
+
         info!("Кэш нод: {} записей, way'ев: {}", self.node_coords.len(), self.way_coords.len());
         self.node_coords.clear();
         self.node_coords.shrink_to_fit();
@@ -178,6 +210,110 @@ impl PbfParser {
         );
 
         Ok(objects)
+    }
+
+    /// Извлечь границу страны (`admin_level=2`) из PBF отдельными проходами.
+    fn extract_boundary(&mut self, path: &Path) -> Result<()> {
+        use osmpbf::RelMemberType;
+
+        // Проход 1: найти relation страны и собрать member-way по ролям.
+        let mut outer_ids: Vec<i64> = Vec::new();
+        let mut inner_ids: Vec<i64> = Vec::new();
+        let mut found = false;
+        {
+            let reader = ElementReader::from_path(path)?;
+            reader.for_each(|element| {
+                if found {
+                    return;
+                }
+                if let Element::Relation(rel) = element {
+                    let tags: HashMap<String, String> = rel
+                        .tags()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect();
+                    if tags.get("boundary").map(|s| s.as_str()) == Some("administrative")
+                        && tags.get("admin_level").map(|s| s.as_str()) == Some("2")
+                        && let Some(c) = crate::country::from_tags(&tags)
+                        && self
+                            .detected_country
+                            .as_ref()
+                            .map_or(true, |dc| dc.code.is_empty() || dc.code == c.code) {
+                            for member in rel.members() {
+                                if member.member_type == RelMemberType::Way {
+                                    if member.role().unwrap_or("") == "inner" {
+                                        inner_ids.push(member.member_id);
+                                    } else {
+                                        outer_ids.push(member.member_id);
+                                    }
+                                }
+                            }
+                            found = true;
+                        }
+                }
+            })?;
+        }
+
+        if outer_ids.is_empty() {
+            return Ok(());
+        }
+
+        // Проход 2: собрать node refs для нужных way'ев.
+        let way_ids: HashSet<i64> = outer_ids.iter().chain(inner_ids.iter()).cloned().collect();
+        let mut way_refs: HashMap<i64, Vec<i64>> = HashMap::new();
+        {
+            let reader = ElementReader::from_path(path)?;
+            reader.for_each(|element| {
+                if let Element::Way(way) = element
+                    && way_ids.contains(&way.id()) {
+                        way_refs.insert(way.id(), way.refs().collect());
+                    }
+            })?;
+        }
+
+        // Проход 3: собрать координаты нужных нод.
+        let node_ids: HashSet<i64> = way_refs.values().flatten().cloned().collect();
+        let mut node_coords: HashMap<i64, (f64, f64)> = HashMap::new();
+        {
+            let reader = ElementReader::from_path(path)?;
+            reader.for_each(|element| {
+                match &element {
+                    Element::Node(n) if node_ids.contains(&n.id()) => {
+                        node_coords.insert(n.id(), (n.lat(), n.lon()));
+                    }
+                    Element::DenseNode(n) if node_ids.contains(&n.id()) => {
+                        node_coords.insert(n.id(), (n.lat(), n.lon()));
+                    }
+                    _ => {}
+                }
+            })?;
+        }
+
+        let to_polyline = |ids: &[i64]| -> Option<Vec<(f32, f32)>> {
+            let mut pts = Vec::with_capacity(ids.len());
+            for id in ids {
+                if let Some(&(lat, lon)) = node_coords.get(id) {
+                    pts.push((lat as f32, lon as f32));
+                }
+            }
+            (pts.len() >= 2).then_some(pts)
+        };
+
+        let outer_ways: Vec<Vec<(f32, f32)>> = way_refs
+            .iter()
+            .filter(|(id, _)| outer_ids.contains(id))
+            .filter_map(|(_, refs)| to_polyline(refs))
+            .collect();
+        let inner_ways: Vec<Vec<(f32, f32)>> = way_refs
+            .iter()
+            .filter(|(id, _)| inner_ids.contains(id))
+            .filter_map(|(_, refs)| to_polyline(refs))
+            .collect();
+
+        self.boundary = crate::boundary::build_boundary(outer_ways, inner_ways);
+        if self.boundary.is_some() {
+            log::info!("Граница страны извлечена (полигонов: {})", self.boundary.as_ref().unwrap().polygons.len());
+        }
+        Ok(())
     }
 
     /// Вычислить центроид relation по координатам node-членов.
@@ -245,6 +381,12 @@ impl PbfParser {
 
         match rel_type {
             Some("boundary") if tags.get("boundary") == Some(&"administrative".to_string()) => {
+                // Определяем страну по границе страны (admin_level=2).
+                if tags.get("admin_level").map(|s| s.as_str()) == Some("2")
+                    && let Some(c) = crate::country::from_tags(tags) {
+                        self.admin_country = Some(c);
+                    }
+
                 if let Some(obj) = extract_named_object(tags, lat, lon, self.corrector.as_ref()) {
                     let admin_level = tags.get("admin_level").cloned();
                     let mut obj = obj;
@@ -288,6 +430,12 @@ impl PbfParser {
         lon: f64,
         objects: &mut Vec<GeoObject>,
     ) {
+        // Считаем addr:country для fallback-определения страны.
+        if let Some(c) = tags.get("addr:country")
+            && !c.is_empty() {
+                *self.addr_country_counts.entry(c.clone()).or_default() += 1;
+            }
+
         let has_address = tags.contains_key("addr:housenumber")
             || tags.contains_key("addr:street")
             || tags.contains_key("addr:city");
@@ -329,6 +477,14 @@ impl crate::source::FeatureSource for PbfParser {
     fn parse(&mut self, path: &Path) -> Result<Vec<GeoObject>> {
         self.parse_file(path)
     }
+
+    fn country(&self) -> Option<Country> {
+        self.detected_country.clone()
+    }
+
+    fn boundary(&self) -> Option<CountryBoundary> {
+        self.boundary.clone()
+    }
 }
 
 /// Привязать адреса без города к ближайшему известному городу по координатам.
@@ -346,14 +502,13 @@ pub fn infer_missing_cities(objects: &mut [GeoObject]) {
             GeoObject::Address(addr) => (addr.lat, addr.lon, addr.city.as_ref()),
             GeoObject::Named(named) => (named.lat, named.lon, named.city.as_ref()),
         };
-        if let Some(city) = city_opt {
-            if !city.is_empty() {
+        if let Some(city) = city_opt
+            && !city.is_empty() {
                 let entry = city_coords.entry(city.clone()).or_insert((0.0, 0.0, 0));
                 entry.0 += lat;
                 entry.1 += lon;
                 entry.2 += 1;
             }
-        }
         pb.inc(1);
     }
     pb.finish_and_clear();
@@ -374,7 +529,7 @@ pub fn infer_missing_cities(objects: &mut [GeoObject]) {
     //    Поиск остаётся точным: клетки расширяются кольцами, пока нижняя
     //    граница расстояния до следующего кольца не превысит найденный минимум.
     const CELL_DEG: f64 = 0.05; // ~5.5 км по меридиану
-    let mut grid: HashMap<(i64, i64), Vec<(&str, f64, f64)>> = HashMap::new();
+    let mut grid: CityGrid<'_> = HashMap::new();
     let mut max_abs_lat: f64 = 0.0;
     for &(name, lat, lon) in &centroids {
         let cx = (lon / CELL_DEG).floor() as i64;
@@ -392,7 +547,7 @@ pub fn infer_missing_cities(objects: &mut [GeoObject]) {
             GeoObject::Address(addr) => (addr.lat, addr.lon, &mut addr.city),
             GeoObject::Named(named) => (named.lat, named.lon, &mut named.city),
         };
-        if city_ref.as_ref().map_or(true, |c| c.is_empty()) {
+        if city_ref.as_ref().is_none_or(|c| c.is_empty()) {
             let qx = (lon / CELL_DEG).floor() as i64;
             let qy = (lat / CELL_DEG).floor() as i64;
             // Консервативная нижняя граница расстояния до следующего кольца:
@@ -447,82 +602,6 @@ pub fn infer_missing_cities(objects: &mut [GeoObject]) {
     }
 }
 
-/// Проставить страну для всех объектов, у которых она не задана.
-///
-/// Источники (в порядке приоритета):
-/// 1. Если страна уже задана в объекте — не трогаем.
-/// 2. Если известен город — ищем страну по другим объектам в том же городе.
-/// 3. Извлекаем код страны из кода региона (напр. "RU-CFD" → "RU").
-pub fn infer_missing_countries(objects: &mut [GeoObject], region_code: Option<&str>) {
-    use std::collections::HashMap;
-
-    // 1. Строим карту «город → страна» по объектам, где известны оба
-    let mut city_country: HashMap<String, String> = HashMap::new();
-    let pb = crate::utils::progress_bar(objects.len() as u64, "Сбор карты город → страна");
-    for obj in objects.iter() {
-        let (city_opt, country_opt) = match obj {
-            GeoObject::Address(addr) => (addr.city.as_ref(), addr.country.as_ref()),
-            GeoObject::Named(named) => (named.city.as_ref(), named.country.as_ref()),
-        };
-        if let (Some(city), Some(country)) = (city_opt, country_opt) {
-            if !city.is_empty() && !country.is_empty() {
-                city_country.entry(city.clone()).or_insert_with(|| country.clone());
-            }
-        }
-        pb.inc(1);
-    }
-    pb.finish_and_clear();
-
-    // 2. Извлекаем код страны из региона (первые 2 символа до дефиса или всё)
-    let region_country = region_code
-        .and_then(|r| r.split(['-', '_']).next())
-        .filter(|c| c.len() == 2 && c.chars().all(|ch| ch.is_ascii_uppercase()));
-
-    // 3. Проставляем страну
-    let mut assigned = 0u64;
-    let pb = crate::utils::progress_bar(objects.len() as u64, "Привязка страны");
-    for obj in objects.iter_mut() {
-        pb.inc(1);
-        // Извлекаем город ДО мутабельного заимствования страны
-        let city_opt: Option<String> = match obj {
-            &mut GeoObject::Address(ref addr) => addr.city.clone(),
-            &mut GeoObject::Named(ref named) => named.city.clone(),
-        };
-
-        let country_ref: &mut Option<String> = match obj {
-            GeoObject::Address(addr) => &mut addr.country,
-            GeoObject::Named(named) => &mut named.country,
-        };
-
-        // Уже задана — пропускаем
-        if country_ref.as_ref().map_or(false, |c| !c.is_empty()) {
-            continue;
-        }
-
-        // Пробуем найти страну по городу
-        if let Some(ref city) = city_opt {
-            if let Some(country) = city_country.get(city.as_str()) {
-                *country_ref = Some(country.clone());
-                assigned += 1;
-                continue;
-            }
-        }
-
-        // Fallback: из кода региона
-        if let Some(rc) = region_country {
-            *country_ref = Some(rc.to_string());
-            assigned += 1;
-        }
-    }
-    pb.finish_and_clear();
-
-    if assigned > 0 {
-        log::info!(
-            "Привязка стран: {} объектам проставлена страна (городская карта: {} городов, регион: {:?})",
-            assigned, city_country.len(), region_country
-        );
-    }
-}
 
 /// Склеить города-опечатки с каноническими названиями.
 ///
@@ -542,11 +621,10 @@ pub fn merge_typo_cities(objects: &mut [GeoObject]) {
             GeoObject::Address(addr) => addr.city.as_ref(),
             GeoObject::Named(named) => named.city.as_ref(),
         };
-        if let Some(city) = city_opt {
-            if !city.is_empty() {
+        if let Some(city) = city_opt
+            && !city.is_empty() {
                 *city_counts.entry(city.clone()).or_default() += 1;
             }
-        }
         pb.inc(1);
     }
     pb.finish_and_clear();
@@ -588,12 +666,11 @@ pub fn merge_typo_cities(objects: &mut [GeoObject]) {
             GeoObject::Address(addr) => &mut addr.city,
             GeoObject::Named(named) => &mut named.city,
         };
-        if let Some(city) = city_ref.as_deref() {
-            if let Some(fixed) = replacements.get(city) {
+        if let Some(city) = city_ref.as_deref()
+            && let Some(fixed) = replacements.get(city) {
                 *city_ref = Some(fixed.clone());
                 merged += 1;
             }
-        }
         pb.inc(1);
     }
     pb.finish_and_clear();
@@ -688,18 +765,15 @@ pub(crate) fn extract_address(tags: &HashMap<String, String>, lat: f64, lon: f64
     let street_tag = tags.get("addr:street").cloned();
     let mut street = correct_field(split_street(street_tag.clone()), corrector);
     let housenumber = tags.get("addr:housenumber").cloned();
-    let postcode = tags.get("addr:postcode").cloned();
 
     // Тега улицы нет вовсе — пробуем подставить тип населённого пункта.
     // Если же улица указана, но в ней нет части-улицы (только регион/населённый
     // пункт), адрес не используем.
-    if street.is_none() && street_tag.is_none() {
-        if let Some(ref city_name) = city {
-            if let Some(place_desc) = place_types.get(city_name) {
+    if street.is_none() && street_tag.is_none()
+        && let Some(ref city_name) = city
+            && let Some(place_desc) = place_types.get(city_name) {
                 street = Some(format!("{} {}", place_desc, city_name));
             }
-        }
-    }
 
     // Требуем улицу и номер дома; адреса без улицы не включаем
     if street.is_none() || housenumber.is_none() {
@@ -711,7 +785,6 @@ pub(crate) fn extract_address(tags: &HashMap<String, String>, lat: f64, lon: f64
         city,
         street,
         housenumber,
-        postcode,
         lat,
         lon,
     })

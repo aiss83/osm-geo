@@ -1,11 +1,13 @@
 //! CLI osm-geo — ETL-пайплайн для подготовки офлайн-базы геокодирования.
 //!
 //! Основные команды:
-//!   build   — сборка базы для региона
+//!   build   — сборка базы для страны
 //!   convert — конвертация OSM PBF в GeoDesk GOL
 
 mod compact;
+mod boundary;
 mod corrector;
+mod country;
 mod dedup;
 mod downloader;
 mod finalizer;
@@ -42,19 +44,20 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Сборка базы данных для региона
+    /// Сборка базы данных для страны
     Build {
-        /// PBF-файл (локальный путь) или регион Geofabrik (напр. russia/central-fed-district)
+        /// PBF-файл (локальный путь) или страна Geofabrik (напр. russia)
         #[arg(short, long)]
         input: String,
 
-        /// Путь к выходному файлу (по умолчанию: {stem}.db или {stem}.bin)
+        /// Путь к выходному файлу (по умолчанию: {stem}.bin)
         #[arg(short, long)]
         output: Option<PathBuf>,
 
-        /// Код региона (напр. RU-CFD)
-        #[arg(short, long)]
-        region: Option<String>,
+        /// Код страны ISO 3166-1 alpha-2 (напр. RU). Если не задан —
+        /// определяется по имени файла.
+        #[arg(long)]
+        country: Option<String>,
 
         /// Источник данных: auto (по расширению), pbf или gol
         #[arg(long, default_value = "auto")]
@@ -105,9 +108,9 @@ fn main() -> Result<()> {
         Commands::Build {
             input,
             output,
-            region,
+            country,
             source,
-        } => cmd_build(&input, output.as_ref(), region.as_deref(), &source),
+        } => cmd_build(&input, output.as_ref(), country.as_deref(), &source),
         Commands::Convert {
             input,
             output,
@@ -121,7 +124,7 @@ fn main() -> Result<()> {
 fn cmd_build(
     input: &str,
     output: Option<&PathBuf>,
-    region: Option<&str>,
+    country_flag: Option<&str>,
     source_kind: &str,
 ) -> Result<()> {
     info!("=== Сборка базы данных ===");
@@ -135,11 +138,7 @@ fn cmd_build(
         Some(p) => {
             let s = p.to_string_lossy();
             // Отрезаем известное расширение, если указано
-            let trimmed = s
-                .strip_suffix(".db.zst")
-                .or_else(|| s.strip_suffix(".db"))
-                .or_else(|| s.strip_suffix(".bin"))
-                .unwrap_or(&s);
+            let trimmed = s.strip_suffix(".bin").unwrap_or(&s);
             PathBuf::from(trimmed)
         }
         None => {
@@ -175,14 +174,41 @@ fn cmd_build(
     let mut objects = src.parse(&input_path)?;
     info!("Извлечено {} объектов", objects.len());
 
+    // 3a. Определяем страну: данные файла → --country → имя файла.
+    let detected = src.country();
+    let boundary = src.boundary();
+    let mut country = detected
+        .or_else(|| country_flag.and_then(country::from_code))
+        .or_else(|| country::from_filename(&input_path.to_string_lossy()))
+        .unwrap_or_else(|| {
+            log::warn!("Не удалось определить страну; сохраняю пустой код");
+            model::Country::default()
+        });
+    if country.name.is_empty() && !country.code.is_empty() {
+        if let Some(c) = country::from_code(&country.code) {
+            country.name = c.name;
+        }
+    }
+    info!("Страна: {} ({})", country.code, country.name);
+
+    // Унифицируем страну у всех объектов — для консистентной дедупликации.
+    for obj in &mut objects {
+        let slot = match obj {
+            model::GeoObject::Address(a) => &mut a.country,
+            model::GeoObject::Named(n) => &mut n.country,
+        };
+        *slot = if country.code.is_empty() {
+            None
+        } else {
+            Some(country.code.clone())
+        };
+    }
+
     // 4. Привязка адресов без города к ближайшему городу
     parser::infer_missing_cities(&mut objects);
 
     // 4b. Склеивание городов-опечаток с каноническими названиями
     parser::merge_typo_cities(&mut objects);
-
-    // 4d. Простановка страны для объектов без страны
-    parser::infer_missing_countries(&mut objects, region);
 
     // 4c. Нормализация названий (нейросеть при наличии ONNX, всегда rule-based)
     {
@@ -227,7 +253,7 @@ fn cmd_build(
     info!("Запись в компактном формате: {:?}", output_path);
 
     let mut writer = compact::CompactWriter::new();
-    writer.build(&objects, &output_path, region.unwrap_or("unknown"), timestamp)?;
+    writer.build(&objects, &output_path, &country, boundary.as_ref(), timestamp)?;
     let file_size = std::fs::metadata(&output_path)?.len();
 
     info!(
@@ -239,7 +265,8 @@ fn cmd_build(
     let output_dir = output_path.parent().unwrap_or(std::path::Path::new("."));
     let mut metadata = finalizer::Metadata {
         version: env!("CARGO_PKG_VERSION").to_string(),
-        region: region.unwrap_or("unknown").to_string(),
+        country: country.code.clone(),
+        country_name: country.name.clone(),
         build_date: crate::utils::today_iso(),
         source_pbf: input_path.display().to_string(),
         object_count: count,

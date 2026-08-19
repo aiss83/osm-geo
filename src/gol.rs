@@ -13,7 +13,7 @@ use anyhow::{bail, Context, Result};
 use log::info;
 
 use crate::corrector::Corrector;
-use crate::model::GeoObject;
+use crate::model::{Country, CountryBoundary, GeoObject};
 use crate::source::FeatureSource;
 
 const GOL_VERSION: &str = "2.3.2";
@@ -153,6 +153,26 @@ impl GolTool {
         }
         Ok(())
     }
+
+    /// Выгрузить результаты GOQL-запроса из GOL в формате GeoJSON (stdout).
+    pub fn query_geojson(&self, gol: &Path, query: &str) -> Result<String> {
+        let output = Command::new(&self.binary)
+            .arg("query")
+            .arg(gol)
+            .arg(query)
+            .arg("-f")
+            .arg("geojson")
+            .output()
+            .with_context(|| format!("Запуск '{}'", self.binary.display()))?;
+
+        if !output.status.success() {
+            bail!(
+                "gol query завершился с ошибкой (статус {:?})",
+                output.status.code()
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
 }
 
 /// Источник гео-объектов из GOL.
@@ -162,11 +182,17 @@ impl GolTool {
 /// расчёт центроидов полностью совпадают с прямым разбором PBF.
 pub struct GolSource {
     corrector: Option<Corrector>,
+    country: Option<Country>,
+    boundary: Option<CountryBoundary>,
 }
 
 impl GolSource {
     pub fn new() -> Self {
-        Self { corrector: None }
+        Self {
+            corrector: None,
+            country: None,
+            boundary: None,
+        }
     }
 }
 
@@ -191,11 +217,32 @@ impl FeatureSource for GolSource {
         parser.set_corrector(self.corrector.take());
         let result = parser.parse_file(&temp);
 
+        self.country = parser.country();
+        self.boundary = parser.boundary();
+
+        // Граница страны из GOL (temp-PBF запросов не содержит admin_level=2).
+        if self.boundary.is_none()
+            && let Some(c) = &self.country
+            && !c.code.is_empty() {
+                let query = format!("*[\"ISO3166-1:alpha2\"={}]", c.code);
+                if let Ok(json) = tool.query_geojson(path, &query) {
+                    self.boundary = crate::boundary::parse_geojson_boundary(&json);
+                }
+            }
+
         // Временные PBF больше не нужны; ошибки удаления игнорируем.
         let _ = std::fs::remove_file(&temp);
         let _ = std::fs::remove_file(&temp_poi);
 
         result
+    }
+
+    fn country(&self) -> Option<Country> {
+        self.country.clone()
+    }
+
+    fn boundary(&self) -> Option<CountryBoundary> {
+        self.boundary.clone()
     }
 }
 

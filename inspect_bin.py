@@ -6,12 +6,13 @@ with open(sys.argv[1], 'rb') as f:
 # Parse header
 magic, version, rec_count, addr_cnt, named_cnt = struct.unpack_from('<4sHIII', data, 0)
 ts = struct.unpack_from('<Q', data, 18)[0]
-region = data[26:72].rstrip(b'\x00').decode('utf-8', errors='replace')
+country_code = data[26:30].rstrip(b'\x00').decode('utf-8', errors='replace')
+country_name = data[30:72].rstrip(b'\x00').decode('utf-8', errors='replace')
 sp_off, ni_off, ai_off, rec_off = struct.unpack_from('<IIII', data, 72)
 
 print(f"Magic: {magic}, Version: {version}")
 print(f"Records: {rec_count}, Addr: {addr_cnt}, Named: {named_cnt}")
-print(f"Region: '{region}', Timestamp: {ts}")
+print(f"Country: '{country_code}' ({country_name}), Timestamp: {ts}")
 print(f"Offsets: SP={sp_off}, NI={ni_off}, AI={ai_off}, REC={rec_off}")
 
 # Section Directory (version >= 2)
@@ -71,11 +72,10 @@ for i in range(min(rec_count, 10)):
         city = pool[city_idx] if city_idx < len(pool) else f"OOB({city_idx})"
         print(f"  [{i}] Addr: lat={lat:.4f} lon={lon:.4f} city={city_idx}='{city}' street={street_idx} hn={hn_idx}")
     elif obj_type == 1:
-        country_idx, city_idx, name_idx, cat = struct.unpack_from('<IIIB', data, pos); pos += 13
-        country = pool[country_idx] if country_idx < len(pool) else f"OOB({country_idx})"
+        city_idx, name_idx, cat = struct.unpack_from('<IIB', data, pos); pos += 9
         city = pool[city_idx] if city_idx < len(pool) else f"OOB({city_idx})"
         name = pool[name_idx] if name_idx < len(pool) else f"OOB({name_idx})"
-        print(f"  [{i}] Named: lat={lat:.4f} lon={lon:.4f} country={country_idx}='{country}' city={city_idx}='{city}' name={name_idx}='{name}' cat={cat}")
+        print(f"  [{i}] Named: lat={lat:.4f} lon={lon:.4f} city={city_idx}='{city}' name={name_idx}='{name}' cat={cat}")
     else:
         print(f"  [{i}] UNKNOWN type={obj_type}")
 
@@ -97,5 +97,11 @@ for sid, label in [(5, 'FTS Address tokens'), (6, 'FTS Address postings'),
     else:
         total = struct.unpack_from('<I', data, soff)[0]
         print(f"\n{label}: {total} postings ({slen} bytes)")
+
+# Country Boundary (version >= 3)
+if 9 in sections:
+    soff, slen = sections[9]
+    min_lat, min_lon, max_lat, max_lon, poly_count = struct.unpack_from('<ffffI', data, soff)
+    print(f"\nCountry Boundary: bbox=({min_lat:.4f},{min_lon:.4f})..({max_lat:.4f},{max_lon:.4f}) polygons={poly_count} ({slen} bytes)")
 
 

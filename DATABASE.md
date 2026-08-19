@@ -35,7 +35,7 @@
 
 - **Привязка к городам** — адреса и POI без `addr:city` привязываются к ближайшему населённому пункту по координатам (Haversine).
 - **Склеивание опечаток в городах** — «Калининнград» → «Калининград» по редакционному расстоянию.
-- **Привязка к стране** — для объектов без страны код определяется по городу или из кода региона (`-r RU-CFD` → `RU`).
+- **Страна** — одна страна на файл, определяется по данным/имени файла или флагом `--country` и сохраняется один раз (код + название).
 
 ### Фильтрация POI
 
@@ -46,7 +46,9 @@
 ### Модель данных
 
 - **Address** — иерархический адрес: `country`, `city`, `street`,
-  `housenumber`, `postcode` + координаты `(lat, lon)`.
+  `housenumber` + координаты `(lat, lon)`. В компактном формате для адреса
+  сохраняются только `city`, `street`, `housenumber`; `country`/`postcode`
+  не сохраняются.
 - **NamedObject** — именованный объект: `name`, `category`,
   `country`, `city` + координаты `(lat, lon)`.
 
@@ -54,7 +56,7 @@
 
 | Секция | Описание |
 |--------|----------|
-| Header | 88 B — magic, version, счётчики, timestamp, регион, offsets |
+| Header | 88 B — magic, version, счётчики, timestamp, страна, offsets |
 | Section Directory | таблица секций `(id, offset, length)` |
 | String Pool | все уникальные строки, индекс 0 — пустая строка |
 | Named Index | сортирован по имени, для префиксного поиска |
@@ -62,6 +64,7 @@
 | Record Block | сортирован по `(lat, lon)`, для пространственного поиска |
 | FTS Address tokens/postings | инвертированный индекс адресов |
 | FTS Named tokens/postings | инвертированный индекс POI |
+| Country Boundary | граница страны: bbox + MultiPolygon |
 
 Все многобайтовые поля — little-endian.
 
@@ -100,12 +103,13 @@
 | Смещение | Размер | Поле | Описание |
 |----------|--------|------|----------|
 | 0 | 4 B | `magic` | `OSMG` (0x4F 0x53 0x4D 0x47) |
-| 4 | 2 B | `version` | `2` |
+| 4 | 2 B | `version` | `3` |
 | 6 | 4 B | `record_count` | общее количество объектов |
 | 10 | 4 B | `addr_count` | количество адресов |
 | 14 | 4 B | `named_count` | количество POI |
 | 18 | 8 B | `build_timestamp` | Unix timestamp сборки |
-| 26 | 46 B | `region` | код региона UTF-8, zero-padded |
+| 26 | 4 B | `country_code` | ISO 3166-1 alpha-2, zero-padded (`RU`) |
+| 30 | 42 B | `country_name` | название страны UTF-8, zero-padded |
 | 72 | 4 B | `string_pool_offset` | смещение String Pool |
 | 76 | 4 B | `named_index_offset` | смещение Named Index |
 | 80 | 4 B | `addr_index_offset` | смещение Address Index |
@@ -132,6 +136,7 @@ entries[count]:        id:u16, offset:u32, length:u32   (10 байт)
 | 6 | FTS Address postings |
 | 7 | FTS Named token dictionary |
 | 8 | FTS Named postings |
+| 9 | Country Boundary |
 
 ### 2.3. String Pool
 
@@ -195,13 +200,32 @@ records[count]:
   lat:                 f32
   lon:                 f32
   Address:             city_idx:u32, street_idx:u32, housenumber_idx:u32   (12 байт)
-  Named:               country_idx:u32, city_idx:u32, name_idx:u32, category:u8  (13 байт)
+  Named:               city_idx:u32, name_idx:u32, category:u8  (9 байт)
 ```
 
 `record_idx` в Named/Address Index — это **логический номер записи в Record
 Block (0-based)**, а не байтовое смещение. Записи имеют переменную длину, поэтому
 для произвольного доступа нужно пройти Record Block последовательно или построить
 таблицу смещений при загрузке.
+
+### 2.7. Country Boundary
+
+Секция с границей страны (bbox + MultiPolygon). Все координаты — `f32`.
+
+```
+min_lat:            f32
+min_lon:            f32
+max_lat:            f32
+max_lon:            f32
+polygon_count:      u32
+per polygon:
+  ring_count:       u32
+  per ring:
+    point_count:    u32
+    points:         (lat f32, lon f32) * point_count
+```
+
+Первое кольцо полигона — внешнее, остальные — внутренние «дырки».
 
 ## 3. Полнотекстовый индекс (FTS)
 
@@ -269,7 +293,7 @@ postings:              varint-поток (unsigned LEB128)
    (`1-й`, `12/1`);
 3. привести к нижнему регистру;
 4. для текстовых полей (`city`, `street`, `name`) применить Snowball Russian
-   к каждому слову; для `housenumber`/`postcode`/`category` — не стеммировать.
+   к каждому слову; для `housenumber` — не стеммировать.
 
 Примеры:
 
@@ -293,9 +317,10 @@ postings:              varint-поток (unsigned LEB128)
 ```json
 {
   "version": "0.2.0",
-  "region": "RU-CFD",
+  "country": "RU",
+  "country_name": "Россия",
   "build_date": "2026-08-14",
-  "source_pbf": "data/central-fed-district-latest.osm.pbf",
+  "source_pbf": "data/russia-latest.osm.pbf",
   "object_count": 1923920,
   "address_count": 1897875,
   "named_count": 26045,
@@ -328,12 +353,13 @@ postings:              varint-поток (unsigned LEB128)
 
 typedef struct {
     uint8_t  magic[4];           /* 0x4F 0x53 0x4D 0x47 = "OSMG"       */
-    uint16_t version;            /* 2                                    */
+    uint16_t version;            /* 3                                    */
     uint32_t record_count;
     uint32_t addr_count;
     uint32_t named_count;
     uint64_t build_timestamp;
-    uint8_t  region[46];
+    uint8_t  country_code[4];    /* ISO 3166-1 alpha-2, zero-padded      */
+    uint8_t  country_name[42];   /* UTF-8, zero-padded                  */
     uint32_t string_pool_offset;
     uint32_t named_index_offset;
     uint32_t addr_index_offset;
@@ -366,11 +392,10 @@ typedef struct {
 } RecordAddr;                   /* 12 байт после type+lat+lon */
 
 typedef struct {
-    uint32_t country_idx;
     uint32_t city_idx;
     uint32_t name_idx;
     uint8_t  category;
-} RecordNamed;                  /* 13 байт после type+lat+lon */
+} RecordNamed;                  /* 9 байт после type+lat+lon */
 
 typedef struct {
     uint16_t token_len;
@@ -450,20 +475,20 @@ print('Named Index: OK')
 ### Сборка базы
 
 ```bash
-# Из локального PBF-файла
-osm-geo build --input data/region.osm.pbf --region RU-CFD
+# Из локального PBF-файла (страна определяется по имени файла)
+osm-geo build --input data/russia-latest.osm.pbf
 
-# Из региона Geofabrik (авто-загрузка)
-osm-geo build --input russia/central-fed-district --region RU-CFD
+# Явно указать страну
+osm-geo build --input data/country.osm.pbf --country RU
 
 # Из сжатого PBF (авто-распаковка .gz / .zst)
-osm-geo build --input data/region.osm.pbf.zst
+osm-geo build --input data/russia-latest.osm.pbf.zst
 
 # Из URL
-osm-geo build --input https://example.com/region.osm.pbf
+osm-geo build --input https://example.com/russia-latest.osm.pbf
 
 # Источник данных: auto (по расширению), pbf или gol
-osm-geo build --input data/region.gol --source gol
+osm-geo build --input data/russia.gol --source gol
 ```
 
 ### Конвертация PBF → GOL

@@ -1,16 +1,30 @@
 //! Модель данных: Address (иерархический адрес) и NamedObject (POI/объект).
 //!
-//! Соответствует разделу 2.2.2 ТЗ.
-//!
-//! BLOB не используется — все поля хранятся в плоских колонках SQLite.
-//! NamedObject содержит только русское имя (name:ru/name) и транслитерацию.
+//! Данные сохраняются в компактном бинарном формате (см. `DATABASE.md`).
+//! В компактном формате Address не содержит `country` и `postcode`.
 
-/// Тип сущности в базе.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum ObjectType {
-    Address = 0,
-    NamedObject = 1,
+/// Страна, к которой относится весь файл `.bin`.
+///
+/// `code` — ISO 3166-1 alpha-2 (`RU`), `name` — человекочитаемое название
+/// (`Россия`). `name` может быть пустым, если не удалось определить текст.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Country {
+    pub code: String,
+    pub name: String,
+}
+
+/// Граница страны: bounding box + набор полигонов.
+///
+/// `polygons` — список полигонов; каждый полигон — список колец; каждое
+/// кольцо — список точек `(lat, lon)` в `f32`. Первое кольцо полигона —
+/// внешнее, остальные — внутренние «дырки».
+#[derive(Debug, Clone, Default)]
+pub struct CountryBoundary {
+    pub min_lat: f32,
+    pub min_lon: f32,
+    pub max_lat: f32,
+    pub max_lon: f32,
+    pub polygons: Vec<Vec<Vec<(f32, f32)>>>,
 }
 
 /// Иерархический адрес, привязанный к дому/зданию/участку.
@@ -20,7 +34,6 @@ pub struct Address {
     pub city: Option<String>,
     pub street: Option<String>,
     pub housenumber: Option<String>,
-    pub postcode: Option<String>,
     pub lat: f64,
     pub lon: f64,
 }
@@ -44,13 +57,6 @@ pub enum GeoObject {
 }
 
 impl GeoObject {
-    pub fn object_type(&self) -> ObjectType {
-        match self {
-            GeoObject::Address(_) => ObjectType::Address,
-            GeoObject::Named(_) => ObjectType::NamedObject,
-        }
-    }
-
     pub fn lat_lon(&self) -> (f64, f64) {
         match self {
             GeoObject::Address(a) => (a.lat, a.lon),

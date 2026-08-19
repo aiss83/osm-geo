@@ -12,7 +12,7 @@ use anyhow::{bail, Context, Result};
 use log::info;
 
 use crate::corrector::Corrector;
-use crate::model::GeoObject;
+use crate::model::{Country, CountryBoundary, GeoObject};
 use crate::parser::{extract_address, extract_named_object, place_type_label};
 use crate::source::FeatureSource;
 
@@ -48,13 +48,18 @@ const TAG_KEYS: &[&str] = &[
     "addr:place",
     "addr:street",
     "addr:housenumber",
-    "addr:postcode",
     "historic",
     "tourism",
     "name",
     "name:ru",
+    "name:en",
     "place",
     "landuse",
+    "boundary",
+    "admin_level",
+    "ISO3166-1",
+    "ISO3166-1:alpha2",
+    "ISO3166-1:alpha3",
 ];
 
 const FEATURE_RELATION: i32 = 2;
@@ -111,26 +116,57 @@ fn for_each_feature(
 /// Источник гео-объектов из GOL через FFI (прямое чтение, без PBF).
 pub struct GolFfiSource {
     corrector: Option<Corrector>,
+    country: Option<Country>,
+    boundary: Option<CountryBoundary>,
 }
 
 impl GolFfiSource {
     pub fn new() -> Self {
-        Self { corrector: None }
+        Self {
+            corrector: None,
+            country: None,
+            boundary: None,
+        }
     }
 
-    fn parse_opened(&self, lib: *const GolFeatures) -> Result<Vec<GeoObject>> {
+    fn parse_opened(&mut self, lib: *const GolFeatures) -> Result<Vec<GeoObject>> {
         // Общее число фич — для точных прогресс-баров (один лишний проход).
         let total = unsafe { gol_count(lib) };
 
-        // Проход 1: собираем типы мест (название → «город»/«деревня»/«СНТ»/…).
+        // Проход 1: собираем типы мест и определяем страну.
         let mut place_types: HashMap<String, String> = HashMap::new();
+        let mut addr_country_counts: HashMap<String, u64> = HashMap::new();
+        let mut admin_country: Option<Country> = None;
         for_each_feature(lib, total, "Сбор типов мест из GOL", |_, _, _, tags| {
-            if let Some(place_name) = tags.get("name").or_else(|| tags.get("name:ru")) {
-                if let Some(pt) = place_type_label(&tags) {
+            if let Some(c) = tags.get("addr:country")
+                && !c.is_empty() {
+                    *addr_country_counts.entry(c.clone()).or_default() += 1;
+                }
+            if tags.get("boundary").map(|s| s.as_str()) == Some("administrative")
+                && tags.get("admin_level").map(|s| s.as_str()) == Some("2")
+                && let Some(c) = crate::country::from_tags(&tags) {
+                    admin_country = Some(c);
+                }
+            if let Some(place_name) = tags.get("name").or_else(|| tags.get("name:ru"))
+                && let Some(pt) = place_type_label(&tags) {
                     place_types.entry(place_name.clone()).or_insert(pt);
                 }
-            }
         })?;
+
+        let majority = {
+            let mut best: Option<(u64, String)> = None;
+            for (val, count) in &addr_country_counts {
+                let code = val.trim().to_ascii_uppercase();
+                if code.len() == 2 && code.chars().all(|c| c.is_ascii_uppercase())
+                    && best.as_ref().map_or(true, |(bc, _)| *count > *bc) {
+                        best = Some((*count, code));
+                    }
+            }
+            best.map(|(_, code)| code)
+        };
+        self.country = majority
+            .and_then(|code| crate::country::from_code(&code))
+            .or(admin_country);
 
         // Проход 2: извлекаем адреса и POI.
         let mut objects = Vec::new();
@@ -189,7 +225,26 @@ impl FeatureSource for GolFfiSource {
         let result = self.parse_opened(lib);
         unsafe { gol_close(lib) };
 
+        // Граница страны: GOL-FII не даёт геометрию, используем `gol query -f geojson`.
+        if self.boundary.is_none()
+            && let Some(c) = &self.country
+            && !c.code.is_empty()
+            && let Ok(tool) = crate::gol::GolTool::find_or_install() {
+                let query = format!("*[\"ISO3166-1:alpha2\"={}]", c.code);
+                if let Ok(json) = tool.query_geojson(path, &query) {
+                    self.boundary = crate::boundary::parse_geojson_boundary(&json);
+                }
+            }
+
         info!("Чтение GOL (FFI) завершено");
         result
+    }
+
+    fn country(&self) -> Option<Country> {
+        self.country.clone()
+    }
+
+    fn boundary(&self) -> Option<CountryBoundary> {
+        self.boundary.clone()
     }
 }

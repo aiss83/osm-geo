@@ -107,7 +107,6 @@ mod tests {
             city: Some("Москва".into()),
             street: Some("Тверская".into()),
             housenumber: Some("1".into()),
-            postcode: None,
             lat: 55.0,
             lon: 37.0,
         });
@@ -116,7 +115,6 @@ mod tests {
             city: Some("Москва".into()),
             street: Some("Тверская".into()),
             housenumber: Some("1".into()),
-            postcode: Some("125009".into()),
             lat: 55.1,
             lon: 37.1,
         });
@@ -125,7 +123,6 @@ mod tests {
             city: Some("Москва".into()),
             street: Some("Тверская".into()),
             housenumber: Some("3".into()),
-            postcode: None,
             lat: 55.0,
             lon: 37.0,
         });

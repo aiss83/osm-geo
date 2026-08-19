@@ -68,9 +68,10 @@ pub struct Corrector {
 
 impl Corrector {
     /// Создать новый корректор. Ищет словарь `ru_full.txt` в нескольких местах:
-    /// 1. Рядом с бинарником (текущая рабочая директория)
-    /// 2. В поддиректории `data/`
-    /// При отсутствии скачивает словарь в текущую директорию.
+    /// 1. Рядом с бинарником (текущая рабочая директория);
+    /// 2. В поддиректории `data/`.
+    ///
+    /// При отсутствии словаря скачивает его в текущую директорию.
     pub fn new_or_download() -> Result<Self> {
         // Ищем словарь в нескольких местах
         let candidates = [
@@ -184,14 +185,13 @@ impl Corrector {
 
             let suggestions = self.symspell.lookup(&lower, Verbosity::Closest, 2);
 
-            if let Some(sug) = suggestions.first() {
-                if sug.term != lower {
+            if let Some(sug) = suggestions.first()
+                && sug.term != lower {
                     // Сохраняем оригинальный регистр первой буквы
                     let result = restore_case(&sug.term, word);
                     corrected.push(result);
                     continue;
                 }
-            }
 
             corrected.push((*word).to_string());
         }
@@ -297,19 +297,19 @@ impl Corrector {
         let corrected_adj = if let Some(stem) = try_strip_ending(&adj_lower, "ой") {
             // -ой: твёрдая или мягкая основа (к/г/х → ий)
             let stem_chars: Vec<char> = stem.chars().collect();
-            let soft = stem_chars.last().map_or(false, |c| matches!(c, 'к' | 'г' | 'х'));
+            let soft = stem_chars.last().is_some_and(|c| matches!(c, 'к' | 'г' | 'х'));
             match gender {
-                'f' => format_adj(&adj, &stem, "ая"),
-                'm' => format_adj(&adj, &stem, if soft { "ий" } else { "ый" }),
-                'n' => format_adj(&adj, &stem, if soft { "ое" } else { "ое" }),
+                'f' => format_adj(adj, &stem, "ая"),
+                'm' => format_adj(adj, &stem, if soft { "ий" } else { "ый" }),
+                'n' => format_adj(adj, &stem, "ое"),
                 _ => unreachable!(),
             }
         } else if let Some(stem) = try_strip_ending(&adj_lower, "ей") {
             // -ей: всегда мягкая основа
             match gender {
-                'f' => format_adj(&adj, &stem, "яя"),
-                'm' => format_adj(&adj, &stem, "ий"),
-                'n' => format_adj(&adj, &stem, "ее"),
+                'f' => format_adj(adj, &stem, "яя"),
+                'm' => format_adj(adj, &stem, "ий"),
+                'n' => format_adj(adj, &stem, "ее"),
                 _ => unreachable!(),
             }
         } else {
@@ -530,7 +530,7 @@ fn is_protected_word(lower: &str) -> bool {
 /// Восстановить регистр первой буквы: если оригинал начинался с заглавной,
 /// результат тоже начинается с заглавной.
 fn restore_case(corrected: &str, original: &str) -> String {
-    if original.chars().next().map_or(false, |c| c.is_uppercase()) {
+    if original.chars().next().is_some_and(|c| c.is_uppercase()) {
         title_case_first(corrected)
     } else {
         corrected.to_string()

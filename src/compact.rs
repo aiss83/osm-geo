@@ -6,7 +6,7 @@
 //! - Отсутствия накладных расходов SQLite
 //!
 //! Формат файла (version 2):
-//!   [Header: 88B] — magic, version, counts, timestamp, region, offsets
+//!   [Header: 88B] — magic, version, counts, timestamp, country, offsets
 //!   [Section Directory] — id + offset + length для всех секций
 //!   [String Pool]
 //!   [Named Index]    — сортирован по name, для префиксного поиска
@@ -21,19 +21,20 @@ use std::collections::HashMap;
 use std::io::Write;
 
 use crate::fts::FtsIndex;
-use crate::model::GeoObject;
+use crate::model::{Country, CountryBoundary, GeoObject};
 use crate::stem::RussianStemmer;
 
 /// Заголовок файла (88 байт, little-endian).
 #[repr(C, packed)]
 struct Header {
     magic: [u8; 4],             // "OSMG"
-    version: u16,               // 2
+    version: u16,               // 3
     record_count: u32,
     addr_count: u32,
     named_count: u32,
     build_timestamp: u64,       // Unix timestamp (секунды)
-    region: [u8; 46],           // UTF-8, zero-padded
+    country_code: [u8; 4],      // ISO 3166-1 alpha-2, zero-padded (напр. "RU")
+    country_name: [u8; 42],     // UTF-8, zero-padded
     string_pool_offset: u32,
     named_index_offset: u32,
     addr_index_offset: u32,
@@ -49,6 +50,21 @@ const SECTION_FTS_ADDR_TOKENS: u16 = 5;
 const SECTION_FTS_ADDR_POSTINGS: u16 = 6;
 const SECTION_FTS_NAMED_TOKENS: u16 = 7;
 const SECTION_FTS_NAMED_POSTINGS: u16 = 8;
+const SECTION_COUNTRY_BOUNDARY: u16 = 9;
+
+/// Порядок секций в файле (он же порядок записей в Section Directory).
+/// Длина Section Directory вычисляется от длины этого массива.
+const SECTION_ORDER: [u16; 9] = [
+    SECTION_STRING_POOL,
+    SECTION_NAMED_INDEX,
+    SECTION_ADDR_INDEX,
+    SECTION_RECORDS,
+    SECTION_FTS_ADDR_TOKENS,
+    SECTION_FTS_ADDR_POSTINGS,
+    SECTION_FTS_NAMED_TOKENS,
+    SECTION_FTS_NAMED_POSTINGS,
+    SECTION_COUNTRY_BOUNDARY,
+];
 
 /// Запись в Section Directory: id + offset + length (10 байт).
 struct SectionEntry {
@@ -92,6 +108,29 @@ fn category_to_tag(cat: Option<&str>) -> u8 {
         Some(s) if s.starts_with("admin_level:") => CategoryTag::Boundary as u8,
         _ => CategoryTag::None as u8,
     }
+}
+
+/// Сериализовать границу страны в байты секции Country Boundary.
+fn serialize_boundary(boundary: &CountryBoundary) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&boundary.min_lat.to_le_bytes());
+    buf.extend_from_slice(&boundary.min_lon.to_le_bytes());
+    buf.extend_from_slice(&boundary.max_lat.to_le_bytes());
+    buf.extend_from_slice(&boundary.max_lon.to_le_bytes());
+    buf.extend_from_slice(&(boundary.polygons.len() as u32).to_le_bytes());
+
+    for polygon in &boundary.polygons {
+        buf.extend_from_slice(&(polygon.len() as u32).to_le_bytes());
+        for ring in polygon {
+            buf.extend_from_slice(&(ring.len() as u32).to_le_bytes());
+            for &(lat, lon) in ring {
+                buf.extend_from_slice(&lat.to_le_bytes());
+                buf.extend_from_slice(&lon.to_le_bytes());
+            }
+        }
+    }
+
+    buf
 }
 
 /// Словарь строк: собирает уникальные строки, назначает u32-индексы.
@@ -156,8 +195,8 @@ struct RecordEntry {
     lon: f32,
     /// Для Address: (city, street, housenumber)
     addr_indices: Option<(u32, u32, u32)>,
-    /// Для Named: (country, city, name, category)
-    named_data: Option<(u32, u32, u32, u8)>,
+    /// Для Named: (city, name, category)
+    named_data: Option<(u32, u32, u8)>,
 }
 
 /// Запись в Named Index (сортирована по имени).
@@ -198,7 +237,8 @@ impl CompactWriter {
         &mut self,
         objects: &[GeoObject],
         output_path: &std::path::Path,
-        region: &str,
+        country: &Country,
+        boundary: Option<&CountryBoundary>,
         timestamp: u64,
     ) -> Result<()> {
         info!("Построение компактного бинарного формата...");
@@ -206,16 +246,13 @@ impl CompactWriter {
         // 1. Первый проход: собираем все строки и строим записи
         let mut temp_records: Vec<(f64, f64, RecordEntry)> = Vec::with_capacity(objects.len());
 
-        for (_i, obj) in objects.iter().enumerate() {
+        for obj in objects.iter() {
             let (lat, lon) = obj.lat_lon();
             let record = match obj {
                 GeoObject::Address(addr) => {
                     let city_idx = self.pool.intern(addr.city.as_deref());
                     let street_idx = self.pool.intern(addr.street.as_deref());
                     let hn_idx = self.pool.intern(addr.housenumber.as_deref());
-                    // Интернируем страну и индекс — не храним, но они нужны для полноты пула
-                    self.pool.intern(addr.country.as_deref());
-                    self.pool.intern(addr.postcode.as_deref());
 
                     RecordEntry {
                         obj_type: 0,
@@ -226,7 +263,6 @@ impl CompactWriter {
                     }
                 }
                 GeoObject::Named(obj) => {
-                    let country_idx = self.pool.intern(obj.country.as_deref());
                     let city_idx = self.pool.intern(obj.city.as_deref());
                     let name_idx = self.pool.intern(Some(&obj.name));
                     let category = category_to_tag(obj.category.as_deref());
@@ -236,7 +272,7 @@ impl CompactWriter {
                         lat: lat as f32,
                         lon: lon as f32,
                         addr_indices: None,
-                        named_data: Some((country_idx, city_idx, name_idx, category)),
+                        named_data: Some((city_idx, name_idx, category)),
                     }
                 }
             };
@@ -248,16 +284,14 @@ impl CompactWriter {
 
         // 2. Сортируем записи по (lat, lon) для Record Block
         temp_records.sort_by(|a, b| {
-            a.0.partial_cmp(&b.0)
-                .unwrap()
-                .then_with(|| a.1.partial_cmp(&b.1).unwrap())
+            a.0.total_cmp(&b.0).then_with(|| a.1.total_cmp(&b.1))
         });
 
         self.records = temp_records.iter().map(|(_, _, r)| r.clone()).collect();
 
         // 3. Строим Named Index — сортирован по строке имени
         for (record_idx, rec) in self.records.iter().enumerate() {
-            if let Some((_country_idx, _city_idx, name_idx, category)) = rec.named_data {
+            if let Some((_city_idx, name_idx, category)) = rec.named_data {
                 self.named_index.push(NamedIndexEntry {
                     name_idx,
                     category,
@@ -328,7 +362,7 @@ impl CompactWriter {
                     }
                 }
                 1 => {
-                    let (_country_idx, city_idx, name_idx, _category) = rec.named_data.unwrap();
+                    let (city_idx, name_idx, _category) = rec.named_data.unwrap();
                     let city = &self.pool.strings[city_idx as usize];
                     let name = &self.pool.strings[name_idx as usize];
                     for t in stemmer.stemmed_tokens(name) {
@@ -352,6 +386,7 @@ impl CompactWriter {
 
         let (fts_addr_tokens, fts_addr_postings) = fts_addr.serialize();
         let (fts_named_tokens, fts_named_postings) = fts_named.serialize();
+        let boundary_bytes = serialize_boundary(boundary.unwrap_or(&CountryBoundary::default()));
 
         // 5. Вычисляем offsets и пишем файл.
         let addr_count = self
@@ -364,76 +399,68 @@ impl CompactWriter {
         let named_index_len = (4 + self.named_index.len() * 9) as u32;
         let addr_index_len = (4 + self.addr_index.len() * 16) as u32;
         let records_len =
-            (4 + addr_count as usize * 21 + named_count as usize * 22) as u32;
+            (4 + addr_count as usize * 21 + named_count as usize * 18) as u32;
 
-        // Section Directory: 8 секций, каждая запись 10 байт + count u32.
-        let section_dir_len = (4 + 8 * 10) as u32;
+        // Длина Section Directory считается от SECTION_ORDER.len().
+        let section_dir_len = (4 + SECTION_ORDER.len() * 10) as u32;
 
-        let string_pool_offset = std::mem::size_of::<Header>() as u32 + section_dir_len;
-        let named_index_offset = string_pool_offset + self.pool.serialized_size() as u32;
-        let addr_index_offset = named_index_offset + named_index_len;
-        let records_offset = addr_index_offset + addr_index_len;
-        let fts_addr_tokens_offset = records_offset + records_len;
-        let fts_addr_postings_offset = fts_addr_tokens_offset + fts_addr_tokens.len() as u32;
-        let fts_named_tokens_offset = fts_addr_postings_offset + fts_addr_postings.len() as u32;
-        let fts_named_postings_offset = fts_named_tokens_offset + fts_named_tokens.len() as u32;
+        let section_length = |id: u16| -> u32 {
+            match id {
+                SECTION_STRING_POOL => self.pool.serialized_size() as u32,
+                SECTION_NAMED_INDEX => named_index_len,
+                SECTION_ADDR_INDEX => addr_index_len,
+                SECTION_RECORDS => records_len,
+                SECTION_FTS_ADDR_TOKENS => fts_addr_tokens.len() as u32,
+                SECTION_FTS_ADDR_POSTINGS => fts_addr_postings.len() as u32,
+                SECTION_FTS_NAMED_TOKENS => fts_named_tokens.len() as u32,
+                SECTION_FTS_NAMED_POSTINGS => fts_named_postings.len() as u32,
+                SECTION_COUNTRY_BOUNDARY => boundary_bytes.len() as u32,
+                _ => 0,
+            }
+        };
 
-        let sections = [
-            SectionEntry {
-                id: SECTION_STRING_POOL,
-                offset: string_pool_offset,
-                length: self.pool.serialized_size() as u32,
-            },
-            SectionEntry {
-                id: SECTION_NAMED_INDEX,
-                offset: named_index_offset,
-                length: named_index_len,
-            },
-            SectionEntry {
-                id: SECTION_ADDR_INDEX,
-                offset: addr_index_offset,
-                length: addr_index_len,
-            },
-            SectionEntry {
-                id: SECTION_RECORDS,
-                offset: records_offset,
-                length: records_len,
-            },
-            SectionEntry {
-                id: SECTION_FTS_ADDR_TOKENS,
-                offset: fts_addr_tokens_offset,
-                length: fts_addr_tokens.len() as u32,
-            },
-            SectionEntry {
-                id: SECTION_FTS_ADDR_POSTINGS,
-                offset: fts_addr_postings_offset,
-                length: fts_addr_postings.len() as u32,
-            },
-            SectionEntry {
-                id: SECTION_FTS_NAMED_TOKENS,
-                offset: fts_named_tokens_offset,
-                length: fts_named_tokens.len() as u32,
-            },
-            SectionEntry {
-                id: SECTION_FTS_NAMED_POSTINGS,
-                offset: fts_named_postings_offset,
-                length: fts_named_postings.len() as u32,
-            },
-        ];
+        let mut sections = Vec::with_capacity(SECTION_ORDER.len());
+        let mut cursor = std::mem::size_of::<Header>() as u32 + section_dir_len;
+        for &id in &SECTION_ORDER {
+            let length = section_length(id);
+            sections.push(SectionEntry { id, offset: cursor, length });
+            cursor += length;
+        }
 
-        let mut region_bytes = [0u8; 46];
-        let region_utf8 = region.as_bytes();
-        let copy_len = region_utf8.len().min(45); // last byte stays 0
-        region_bytes[..copy_len].copy_from_slice(&region_utf8[..copy_len]);
+        let offset_of = |id: u16| -> u32 {
+            sections
+                .iter()
+                .find(|s| s.id == id)
+                .map(|s| s.offset)
+                .unwrap_or(0)
+        };
+        let string_pool_offset = offset_of(SECTION_STRING_POOL);
+        let named_index_offset = offset_of(SECTION_NAMED_INDEX);
+        let addr_index_offset = offset_of(SECTION_ADDR_INDEX);
+        let records_offset = offset_of(SECTION_RECORDS);
+
+        let mut country_code = [0u8; 4];
+        let code_bytes = country.code.as_bytes();
+        let code_len = code_bytes.len().min(4);
+        country_code[..code_len].copy_from_slice(&code_bytes[..code_len]);
+
+        let mut country_name = [0u8; 42];
+        let name_bytes = country.name.as_bytes();
+        let mut name_len = name_bytes.len().min(41); // last byte stays 0
+        while name_len > 0 && !country.name.is_char_boundary(name_len) {
+            name_len -= 1;
+        }
+        country_name[..name_len].copy_from_slice(&name_bytes[..name_len]);
 
         let header = Header {
             magic: *b"OSMG",
-            version: 2,
+            version: 3,
             record_count: self.records.len() as u32,
             addr_count,
             named_count,
             build_timestamp: timestamp,
-            region: region_bytes,
+            country_code,
+            country_name,
             string_pool_offset,
             named_index_offset,
             addr_index_offset,
@@ -496,8 +523,7 @@ impl CompactWriter {
                     file.write_all(&hn.to_le_bytes())?;
                 }
                 1 => {
-                    let (country, city, name, category) = rec.named_data.unwrap();
-                    file.write_all(&country.to_le_bytes())?;
+                    let (city, name, category) = rec.named_data.unwrap();
                     file.write_all(&city.to_le_bytes())?;
                     file.write_all(&name.to_le_bytes())?;
                     file.write_all(&[category])?;
@@ -512,6 +538,9 @@ impl CompactWriter {
         file.write_all(&fts_named_tokens)?;
         file.write_all(&fts_named_postings)?;
 
+        // Пишем границу страны
+        file.write_all(&boundary_bytes)?;
+
         let size = file.metadata()?.len();
         info!(
             "Компактный файл записан: {:.2} МБ",
@@ -525,7 +554,7 @@ impl CompactWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Address, NamedObject};
+    use crate::model::{Address, Country, NamedObject};
 
     #[test]
     fn test_string_pool() {
@@ -564,7 +593,6 @@ mod tests {
                 city: Some("Москва".into()),
                 street: Some("Тверская".into()),
                 housenumber: Some("1".into()),
-                postcode: None,
                 lat: 55.7558,
                 lon: 37.6173,
             }),
@@ -572,7 +600,7 @@ mod tests {
 
         let path = std::path::PathBuf::from(std::env::temp_dir().join("test_compact.bin"));
         let mut writer = CompactWriter::new();
-        writer.build(&objects, &path, "RU-TEST", 0).unwrap();
+        writer.build(&objects, &path, &Country { code: "RU".into(), name: "Россия".into() }, None, 0).unwrap();
 
         assert!(path.exists());
         let size = std::fs::metadata(&path).unwrap().len();
@@ -614,7 +642,7 @@ mod tests {
 
         let path = std::path::PathBuf::from(std::env::temp_dir().join("test_compact_sort.bin"));
         let mut writer = CompactWriter::new();
-        writer.build(&objects, &path, "RU-TEST", 0).unwrap();
+        writer.build(&objects, &path, &Country { code: "RU".into(), name: "Россия".into() }, None, 0).unwrap();
 
         // Проверяем, что Named Index отсортирован: А < Б < В
         assert!(writer.named_index.len() == 3);
@@ -642,14 +670,13 @@ mod tests {
             city: Some("Большое Исаково".into()),
             street: Some("Московский проспект съезд 1".into()),
             housenumber: Some("1".into()),
-            postcode: None,
             lat: 54.7,
             lon: 20.5,
         })];
 
         let path = std::path::PathBuf::from(std::env::temp_dir().join("test_compact_roundtrip.bin"));
         let mut writer = CompactWriter::new();
-        writer.build(&objects, &path, "RU-TEST", 0).unwrap();
+        writer.build(&objects, &path, &Country { code: "RU".into(), name: "Россия".into() }, None, 0).unwrap();
 
         // Читаем файл обратно и проверяем строки в пуле
         let data = std::fs::read(&path).unwrap();
@@ -698,7 +725,6 @@ mod tests {
                 city: Some("Москва".into()),
                 street: Some("Я".into()),
                 housenumber: Some("10".into()),
-                postcode: None,
                 lat: 55.0,
                 lon: 37.0,
             }),
@@ -707,7 +733,6 @@ mod tests {
                 city: Some("Москва".into()),
                 street: Some("А".into()),
                 housenumber: Some("1".into()),
-                postcode: None,
                 lat: 56.0,
                 lon: 38.0,
             }),
@@ -715,7 +740,7 @@ mod tests {
 
         let path = std::path::PathBuf::from(std::env::temp_dir().join("test_compact_addr.bin"));
         let mut writer = CompactWriter::new();
-        writer.build(&objects, &path, "RU-TEST", 0).unwrap();
+        writer.build(&objects, &path, &Country { code: "RU".into(), name: "Россия".into() }, None, 0).unwrap();
 
         assert!(writer.addr_index.len() == 2);
 
@@ -808,7 +833,6 @@ mod tests {
                 city: Some("Москва".into()),
                 street: Some("Тверская".into()),
                 housenumber: Some("1".into()),
-                postcode: None,
                 lat: 55.0,
                 lon: 37.0,
             }),
@@ -824,15 +848,15 @@ mod tests {
 
         let path = std::path::PathBuf::from(std::env::temp_dir().join("test_compact_fts.bin"));
         let mut writer = CompactWriter::new();
-        writer.build(&objects, &path, "RU-TEST", 0).unwrap();
+        writer.build(&objects, &path, &Country { code: "RU".into(), name: "Россия".into() }, None, 0).unwrap();
 
         let data = std::fs::read(&path).unwrap();
 
         let version = u16::from_le_bytes(data[4..6].try_into().unwrap());
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
 
         let sections = parse_section_directory(&data, std::mem::size_of::<Header>());
-        assert_eq!(sections.len(), 8);
+        assert_eq!(sections.len(), 9);
 
         let fts_addr_tokens = section_bytes(&data, &sections, SECTION_FTS_ADDR_TOKENS);
         let fts_addr_postings = section_bytes(&data, &sections, SECTION_FTS_ADDR_POSTINGS);

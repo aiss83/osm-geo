@@ -8,7 +8,7 @@ use std::path::Path;
 use anyhow::Result;
 
 use crate::corrector::Corrector;
-use crate::model::GeoObject;
+use crate::model::{Country, CountryBoundary, GeoObject};
 
 /// Вид источника данных.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,6 +26,16 @@ pub trait FeatureSource {
 
     /// Разобрать файл и вернуть извлечённые объекты (адреса и POI).
     fn parse(&mut self, path: &Path) -> Result<Vec<GeoObject>>;
+
+    /// Страна, определённая при разборе (если удалось).
+    fn country(&self) -> Option<Country> {
+        None
+    }
+
+    /// Граница страны, извлечённая при разборе (если удалось).
+    fn boundary(&self) -> Option<CountryBoundary> {
+        None
+    }
 }
 
 /// Определить вид источника по расширению файла.

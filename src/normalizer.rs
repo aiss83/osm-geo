@@ -7,7 +7,6 @@
 //! Потребитель: `cmd_build` в main.rs, между парсером и корректором SymSpell.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 
 use crate::model::GeoObject;
 
@@ -291,10 +290,6 @@ impl Normalizer {
     }
 
 
-    pub fn normalize_batch(&mut self, names: &[&str]) -> Vec<String> {
-        names.iter().map(|&n| self.normalize(n)).collect()
-    }
-
     /// Нормализовать все названия в векторе GeoObject.
     ///
     /// Кэширует результаты: одинаковые названия нормализуются один раз.
@@ -340,11 +335,6 @@ impl Normalizer {
         }
 
         result
-    }
-
-    /// Размер кэша (для диагностики).
-    pub fn cache_size(&self) -> usize {
-        self.cache.len()
     }
 }
 
@@ -597,15 +587,16 @@ mod tests {
         let r1 = n.normalize("ул Ленина");
         let r2 = n.normalize("ул Ленина");
         assert_eq!(r1, r2);
-        assert_eq!(n.cache_size(), 1);
+        assert_eq!(r1, "улица Ленина");
     }
 
     #[test]
     fn test_normalizer_cache_miss() {
         let mut n = Normalizer::new();
-        n.normalize("ул Ленина");
-        n.normalize("пр Мира");
-        assert_eq!(n.cache_size(), 2);
+        let a = n.normalize("ул Ленина");
+        let b = n.normalize("пр Мира");
+        assert_eq!(a, "улица Ленина");
+        assert_eq!(b, "проспект Мира");
     }
 
     #[test]
@@ -617,7 +608,6 @@ mod tests {
             city: Some("Москва".into()),
             street: Some("ул Тверская".into()),
             housenumber: Some("1".into()),
-            postcode: None,
             lat: 55.0,
             lon: 37.0,
         })];

@@ -66,6 +66,7 @@ impl FtsIndex {
             }
 
             let bytes = token.as_bytes();
+            debug_assert!(bytes.len() <= u16::MAX as usize, "FTS-токен слишком длинный");
             tokens_blob.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
             tokens_blob.extend_from_slice(bytes);
             tokens_blob.extend_from_slice(&postings_offset.to_le_bytes());

@@ -47,7 +47,7 @@ for i in range(rec_cnt):
     if obj_type == 0:  # Address
         pos += 12  # city_idx(4) + street_idx(4) + hn_idx(4)
     elif obj_type == 1:  # Named
-        pos += 13  # country_idx(4) + city_idx(4) + name_idx(4) + cat(1)
+        pos += 9  # city_idx(4) + name_idx(4) + cat(1)
     if i == rec_idx:
         break
 
