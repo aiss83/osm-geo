@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use crate::model::GeoObject;
 
 #[cfg(feature = "neural-normalizer")]
-use tract_onnx::prelude::*;
+use std::path::PathBuf;
 
 // ─── Таблицы сокращений ────────────────────────────────────────────────────
 
