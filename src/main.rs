@@ -50,7 +50,7 @@ enum Commands {
         #[arg(short, long)]
         input: String,
 
-        /// Путь к выходному файлу (по умолчанию: {stem}.bin)
+        /// Путь к выходному файлу (по умолчанию: {страна}-{код страны}-{числовой код страны}.osmg)
         #[arg(short, long)]
         output: Option<PathBuf>,
 
@@ -132,21 +132,6 @@ fn cmd_build(
     // 1. Разрешаем входной файл
     let input_path = resolve_input(input)?;
     info!("Входной файл: {:?}", input_path);
-
-    // 2. Определяем базовое имя выходного файла (без расширения)
-    let output_stem = match output {
-        Some(p) => {
-            let s = p.to_string_lossy();
-            // Отрезаем известное расширение, если указано
-            let trimmed = s.strip_suffix(".bin").unwrap_or(&s);
-            PathBuf::from(trimmed)
-        }
-        None => {
-            let stem = downloader::derive_output_stem(&input_path);
-            PathBuf::from(stem)
-        }
-    };
-    info!("Выходной файл (stem): {:?}", output_stem);
 
     // 3. Парсинг источника (PBF или GOL)
     let corrector = corrector::Corrector::new_or_download()
@@ -249,7 +234,23 @@ fn cmd_build(
         .unwrap_or_default()
         .as_secs();
 
-    let output_path = output_stem.with_extension("bin");
+    let output_path = match output {
+        Some(p) => {
+            let s = p.to_string_lossy();
+            // Отрезаем известное расширение, если указано
+            let trimmed = s
+                .strip_suffix(".osmg")
+                .or_else(|| s.strip_suffix(".bin"))
+                .unwrap_or(&s);
+            PathBuf::from(trimmed).with_extension("osmg")
+        }
+        None => {
+            let name = country::output_filename(&country).unwrap_or_else(|| {
+                format!("{}.osmg", downloader::derive_output_stem(&input_path))
+            });
+            PathBuf::from(name)
+        }
+    };
     info!("Запись в компактном формате: {:?}", output_path);
 
     let mut writer = compact::CompactWriter::new();

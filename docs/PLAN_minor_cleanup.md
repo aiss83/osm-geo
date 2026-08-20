@@ -66,7 +66,7 @@ tokens_blob.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
 
 ## 5. Остатки SQLite в `output_stem`
 
-`src/main.rs`, при выборе выходного stem осталось отрезание `.db`/`.db.zst`:
+`src/main.rs`, при выборе выходного пути оставалось отрезание `.db`/`.db.zst`:
 
 ```rust
 let trimmed = s
@@ -76,10 +76,14 @@ let trimmed = s
     .unwrap_or(&s);
 ```
 
-Правка: оставить только `.bin`:
+Правка (сделано): SQLite-остатки убраны; формат теперь `.osmg`, а `.bin`
+оставлен только как legacy-совместимость:
 
 ```rust
-let trimmed = s.strip_suffix(".bin").unwrap_or(&s);
+let trimmed = s
+    .strip_suffix(".osmg")
+    .or_else(|| s.strip_suffix(".bin"))
+    .unwrap_or(&s);
 ```
 
 ## 6. Устаревшие вызовы corrector в parser.rs

@@ -4,25 +4,26 @@ use std::collections::HashMap;
 
 use crate::model::Country;
 
-/// Код alpha-2, русское имя, английское имя для сопоставления с именем файла.
-const COUNTRIES: &[(&str, &str, &str)] = &[
-    ("RU", "Россия", "russia"),
-    ("BY", "Беларусь", "belarus"),
-    ("KZ", "Казахстан", "kazakhstan"),
-    ("UA", "Украина", "ukraine"),
-    ("GE", "Грузия", "georgia"),
-    ("AM", "Армения", "armenia"),
-    ("AZ", "Азербайджан", "azerbaijan"),
-    ("LT", "Литва", "lithuania"),
-    ("LV", "Латвия", "latvia"),
-    ("EE", "Эстония", "estonia"),
-    ("PL", "Польша", "poland"),
-    ("FI", "Финляндия", "finland"),
-    ("MN", "Монголия", "mongolia"),
-    ("CN", "Китай", "china"),
-    ("KP", "КНДР", "north korea"),
-    ("JP", "Япония", "japan"),
-    ("US", "США", "united states"),
+/// alpha-2, русское имя, английское имя (для сопоставления с именем файла),
+/// числовой код ISO 3166-1 numeric.
+const COUNTRIES: &[(&str, &str, &str, &str)] = &[
+    ("RU", "Россия", "russia", "643"),
+    ("BY", "Беларусь", "belarus", "112"),
+    ("KZ", "Казахстан", "kazakhstan", "398"),
+    ("UA", "Украина", "ukraine", "804"),
+    ("GE", "Грузия", "georgia", "268"),
+    ("AM", "Армения", "armenia", "051"),
+    ("AZ", "Азербайджан", "azerbaijan", "031"),
+    ("LT", "Литва", "lithuania", "440"),
+    ("LV", "Латвия", "latvia", "428"),
+    ("EE", "Эстония", "estonia", "233"),
+    ("PL", "Польша", "poland", "616"),
+    ("FI", "Финляндия", "finland", "246"),
+    ("MN", "Монголия", "mongolia", "496"),
+    ("CN", "Китай", "china", "156"),
+    ("KP", "КНДР", "north korea", "408"),
+    ("JP", "Япония", "japan", "392"),
+    ("US", "США", "united states", "840"),
 ];
 
 /// alpha-3 → alpha-2 (для fallback по `ISO3166-1:alpha3`).
@@ -49,9 +50,46 @@ const ALPHA3: &[(&str, &str)] = &[
 fn code_to_name(code: &str) -> String {
     COUNTRIES
         .iter()
-        .find(|(c, _, _)| *c == code)
-        .map(|(_, name, _)| name.to_string())
+        .find(|(c, _, _, _)| *c == code)
+        .map(|(_, name, _, _)| name.to_string())
         .unwrap_or_default()
+}
+
+/// Английское имя страны по alpha-2 коду (для имён файлов).
+fn english_name(code: &str) -> Option<&'static str> {
+    COUNTRIES
+        .iter()
+        .find(|(c, _, _, _)| *c == code)
+        .map(|(_, _, en, _)| *en)
+}
+
+/// Числовой код ISO 3166-1 numeric по alpha-2 коду (строка из трёх цифр).
+fn numeric_code(code: &str) -> Option<&'static str> {
+    COUNTRIES
+        .iter()
+        .find(|(c, _, _, _)| *c == code)
+        .map(|(_, _, _, num)| *num)
+}
+
+/// Привести имя страны к безопасному виду для имени файла:
+/// строчные ASCII-буквы, разделители → дефис.
+fn slugify(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_dash = false;
+    for ch in s.chars() {
+        let alnum = ch.is_ascii_alphanumeric();
+        if alnum {
+            out.push(ch.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !prev_dash && !out.is_empty() {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    out
 }
 
 fn alpha3_to_alpha2(code: &str) -> Option<&'static str> {
@@ -126,7 +164,7 @@ pub fn from_filename(file_name: &str) -> Option<Country> {
     let stem = base.split('.').next().unwrap_or(base);
     let lower = stem.to_lowercase();
 
-    for &(code, name, en) in COUNTRIES {
+    for &(code, name, en, _) in COUNTRIES {
         if lower == en || lower.starts_with(en) || lower.contains(en) {
             return Some(Country {
                 code: code.to_string(),
@@ -135,7 +173,7 @@ pub fn from_filename(file_name: &str) -> Option<Country> {
         }
     }
 
-    for &(code, name, _) in COUNTRIES {
+    for &(code, name, _, _) in COUNTRIES {
         if lower.contains(&name.to_lowercase()) {
             return Some(Country {
                 code: code.to_string(),
@@ -145,6 +183,27 @@ pub fn from_filename(file_name: &str) -> Option<Country> {
     }
 
     None
+}
+
+/// Сформировать имя выходного файла компактного формата:
+/// `{страна}-{код страны}-{числовой код страны}.osmg`.
+///
+/// Страна берётся английским именем (строчными, через дефис), код страны —
+/// alpha-2 в нижнем регистре, числовой код — ISO 3166-1 numeric (три цифры).
+/// Возвращает `None`, если код страны неизвестен.
+pub fn output_filename(country: &Country) -> Option<String> {
+    if country.code.is_empty() {
+        return None;
+    }
+
+    let name = english_name(&country.code)
+        .map(slugify)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| country.code.to_ascii_lowercase());
+    let code = country.code.to_ascii_lowercase();
+    let numeric = numeric_code(&country.code).unwrap_or("000");
+
+    Some(format!("{}-{}-{}.osmg", name, code, numeric))
 }
 
 #[cfg(test)]
@@ -176,5 +235,25 @@ mod tests {
         let c = from_tags(&tags).unwrap();
         assert_eq!(c.code, "RU");
         assert_eq!(c.name, "Россия");
+    }
+
+    #[test]
+    fn test_output_filename() {
+        let c = from_code("RU").unwrap();
+        assert_eq!(output_filename(&c).unwrap(), "russia-ru-643.osmg");
+
+        let us = from_code("US").unwrap();
+        assert_eq!(output_filename(&us).unwrap(), "united-states-us-840.osmg");
+
+        let am = from_code("AM").unwrap();
+        assert_eq!(output_filename(&am).unwrap(), "armenia-am-051.osmg");
+    }
+
+    #[test]
+    fn test_output_filename_unknown_code() {
+        assert!(output_filename(&Country::default()).is_none());
+
+        let c = Country { code: "XX".into(), name: String::new() };
+        assert_eq!(output_filename(&c).unwrap(), "xx-xx-000.osmg");
     }
 }

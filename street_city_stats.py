@@ -1,7 +1,7 @@
 import struct, sys
 from collections import Counter, defaultdict
 
-path = sys.argv[1] if len(sys.argv) > 1 else '/tmp/test-kgd3.bin'
+path = sys.argv[1] if len(sys.argv) > 1 else '/tmp/test-kgd3.osmg'
 
 with open(path, 'rb') as f:
     data = f.read()
